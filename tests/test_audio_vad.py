@@ -31,6 +31,96 @@ async def wait_until(predicate, timeout: float = 0.5) -> None:
 
 
 class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pre_roll_is_prepended_to_new_turn_in_sequence_order(self) -> None:
+        audio = FakeAudioInput()
+        vad = FakeVAD([None, None, None, VADEvent(VADEventKind.SPEECH_STARTED, 0.9)])
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=vad,
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 5):
+            audio.push(frame(sequence, 5_000 if sequence == 4 else 0))
+
+        await wait_until(lambda: runtime.state.turn_state is TurnState.USER_SPEAKING)
+        self.assertEqual(
+            [item.sequence for item in runtime.turn_audio_buffer.snapshot()], [2, 3, 4]
+        )
+        self.assertEqual(runtime.debug_snapshot()["pre_roll_frame_count"], 3)
+        await runtime.close()
+
+    async def test_speech_start_trigger_frame_is_not_duplicated(self) -> None:
+        audio = FakeAudioInput()
+        vad = FakeVAD([None, None, None, VADEvent(VADEventKind.SPEECH_STARTED, 0.9)])
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=vad,
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 5):
+            audio.push(frame(sequence, 5_000 if sequence == 4 else 0))
+
+        await wait_until(lambda: runtime.state.turn_state is TurnState.USER_SPEAKING)
+        sequences = [item.sequence for item in runtime.turn_audio_buffer.snapshot()]
+        self.assertEqual(sequences.count(4), 1)
+        await runtime.close()
+
+    async def test_old_pre_roll_frames_are_evicted(self) -> None:
+        audio = FakeAudioInput()
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=FakeVAD([None] * 5),
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 6):
+            audio.push(frame(sequence))
+
+        await wait_until(lambda: audio.queue_size == 0)
+        self.assertEqual([item.sequence for item in runtime.pre_roll_buffer.snapshot()], [3, 4, 5])
+        self.assertEqual(runtime.pre_roll_buffer.frame_count, 3)
+        await runtime.close()
+
+    async def test_pre_roll_and_multiple_segments_remain_in_one_turn(self) -> None:
+        audio = FakeAudioInput()
+        vad = FakeVAD(
+            [
+                None,
+                None,
+                None,
+                VADEvent(VADEventKind.SPEECH_STARTED),
+                VADEvent(VADEventKind.SPEECH_STOPPED),
+                None,
+                VADEvent(VADEventKind.SPEECH_STARTED),
+                VADEvent(VADEventKind.SPEECH_STOPPED),
+            ]
+        )
+        dialogue, tts = MockDialogueProvider(), MockTTSProvider()
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=vad,
+            dialogue=dialogue,
+            tts=tts,
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 9):
+            audio.push(frame(sequence, 5_000 if sequence in {4, 7} else 0))
+
+        await wait_until(
+            lambda: audio.queue_size == 0 and runtime.state.turn_state is TurnState.AWAITING_COMMIT
+        )
+        self.assertEqual(runtime.turn_audio_buffer.turn_id, "turn-1")
+        self.assertEqual(
+            [item.sequence for item in runtime.turn_audio_buffer.snapshot()],
+            [2, 3, 4, 5, 6, 7, 8],
+        )
+        self.assertEqual(dialogue.stream_calls, 0)
+        self.assertEqual(tts.stream_calls, 0)
+        await runtime.close()
+
     async def test_speech_start_from_audio_path_emits_event_and_enters_user_speaking(self) -> None:
         audio = FakeAudioInput()
         vad = FakeVAD([None, VADEvent(VADEventKind.SPEECH_STARTED, 0.9)])
@@ -45,7 +135,9 @@ class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
         while not events.empty():
             seen.append((await events.get()).name)
         self.assertIn("audio.speech_started", seen)
-        self.assertEqual(runtime.turn_audio_buffer.frame_count, 1)
+        self.assertEqual(
+            [item.sequence for item in runtime.turn_audio_buffer.snapshot()], [1, 2]
+        )
         await runtime.close()
 
     async def test_speech_stop_from_audio_path_does_not_commit_or_start_providers(self) -> None:
@@ -63,7 +155,9 @@ class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
         audio.push(frame(1, 5_000))
         audio.push(frame(2))
 
-        await wait_until(lambda: runtime.state.turn_state is TurnState.AWAITING_COMMIT)
+        await wait_until(
+            lambda: audio.queue_size == 0 and runtime.state.turn_state is TurnState.AWAITING_COMMIT
+        )
         seen = []
         while not events.empty():
             seen.append((await events.get()).name)
@@ -112,7 +206,9 @@ class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for sequence in range(1, 5):
             audio.push(frame(sequence, 5_000 if sequence in {1, 3} else 0))
 
-        await wait_until(lambda: runtime.state.turn_state is TurnState.AWAITING_COMMIT)
+        await wait_until(
+            lambda: audio.queue_size == 0 and runtime.state.turn_state is TurnState.AWAITING_COMMIT
+        )
         self.assertEqual(runtime.turn_audio_buffer.turn_id, "turn-1")
         self.assertEqual(runtime.turn_audio_buffer.frame_count, 4)
         self.assertEqual(dialogue.stream_calls, 0)

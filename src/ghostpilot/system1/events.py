@@ -35,6 +35,20 @@ class AudioFrameDropped:
 
 
 @dataclass(frozen=True, slots=True)
+class TranscriptPartial:
+    turn_id: str
+    text: str
+    name: Literal["transcript.partial"] = "transcript.partial"
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptFinal:
+    turn_id: str
+    text: str
+    name: Literal["transcript.final"] = "transcript.final"
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationTurnStarted:
     turn_id: str
     name: Literal["conversation.turn_started"] = "conversation.turn_started"
@@ -104,6 +118,8 @@ DomainEvent: TypeAlias = (
     | AudioInputStarted
     | AudioInputStopped
     | AudioFrameDropped
+    | TranscriptPartial
+    | TranscriptFinal
     | ConversationTurnStarted
     | ConversationTurnCommitted
     | ConversationAssistantSpeaking

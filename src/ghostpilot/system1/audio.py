@@ -57,10 +57,14 @@ class TurnAudioBuffer:
     def append(self, frame: AudioFrame) -> None:
         self._frames.append(frame)
         self._duration_seconds += frame.duration_seconds
-        while self._frames and self._duration_seconds > self._maximum_seconds:
+        while self._frames and self._duration_seconds > self._maximum_seconds + 1e-9:
             removed = self._frames.popleft()
             self._duration_seconds -= removed.duration_seconds
             self.dropped_frames += 1
+
+    def extend(self, frames: tuple[AudioFrame, ...]) -> None:
+        for frame in frames:
+            self.append(frame)
 
     @property
     def duration_seconds(self) -> float:
@@ -72,4 +76,36 @@ class TurnAudioBuffer:
 
     def snapshot(self) -> tuple[AudioFrame, ...]:
         """A stable view for the future STT adapter; frames themselves are not copied."""
+        return tuple(self._frames)
+
+
+class AudioPreRollBuffer:
+    """Continuously retains the most recent listening audio before VAD decides."""
+
+    def __init__(self, *, maximum_seconds: float) -> None:
+        self._maximum_seconds = maximum_seconds
+        self._frames: deque[AudioFrame] = deque()
+        self._duration_seconds = 0.0
+
+    def append(self, frame: AudioFrame) -> None:
+        self._frames.append(frame)
+        self._duration_seconds += frame.duration_seconds
+        while self._frames and self._duration_seconds > self._maximum_seconds + 1e-9:
+            removed = self._frames.popleft()
+            self._duration_seconds -= removed.duration_seconds
+
+    def clear(self) -> None:
+        self._frames.clear()
+        self._duration_seconds = 0.0
+
+    @property
+    def duration_seconds(self) -> float:
+        return self._duration_seconds
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._frames)
+
+    def snapshot(self) -> tuple[AudioFrame, ...]:
+        """Returns frame references; raw PCM data is not copied."""
         return tuple(self._frames)

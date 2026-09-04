@@ -11,6 +11,7 @@ from typing import Any, Protocol
 class STTEvent:
     text: str
     is_final: bool
+    turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

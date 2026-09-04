@@ -169,6 +169,22 @@ buffer. Milestone 3's STT adapter will consume the buffer snapshot or stream
 from this same ownership boundary. When its duration limit is exceeded, the
 oldest frames are dropped deterministically and counted.
 
+### Pre-roll protection
+
+VAD requires several frames to decide that speech has started. While System 1
+listens, `AudioPreRollBuffer` continuously retains the latest 250 ms of
+canonical microphone frames. On `SPEECH_STARTED`, a newly created
+`TurnAudioBuffer` receives that snapshot, including the trigger frame, before
+live frames continue. This protects the first phonemes, such as `Hel` in
+"Hello GhostPilot", from VAD-decision clipping.
+
+During `AWAITING_COMMIT`, the same turn buffer remains active through short VAD
+pauses and speech resumption. The pre-roll buffer is bounded, carries frame
+references rather than PCM copies, and never reaches the EventBus. Milestone 3
+can consume the complete `TurnAudioBuffer.snapshot()` after commit. The
+PortAudio callback was not changed for this cleanup; native-format capture and
+resampling remain its principal audio-path latency risk.
+
 ### VAD debug UI
 
 The development-only FastAPI/WebSocket UI displays backend-produced VAD state,
@@ -192,6 +208,30 @@ endpoint-waiting behavior without dialogue generation.
 The dashboard also has an **Input device** dropdown. It lists only devices with
 input channels; choosing one and pressing **Use selected input** swaps the
 running `AudioInput` adapter while keeping the System 1 runtime alive.
+
+## Milestone 3A: mock realtime STT and endpointing
+
+Audio frames fan out in parallel to VAD and `STTProvider`. Mock STT emits
+snapshot-style `STTEvent` values: partial text produces `transcript.partial`,
+and stable text produces `transcript.final`. `TranscriptManager` is scoped to a
+turn, replaces overlapping snapshot updates rather than concatenating them, and
+prefers final text as the commit candidate.
+
+VAD stop is still only acoustic information. It enters `AWAITING_COMMIT` and
+starts a cancellation-aware endpoint timer (600 ms by default). The M3A
+`EndpointDetector` commits only if a final transcript is available when the
+timer expires. A partial-only pause remains uncommitted. Speech resumption
+cancels the timer and preserves the same turn ID, turn audio, and transcript.
+Delayed STT events carry optional turn IDs and are ignored unless they match
+the active transcript turn.
+
+For manual mock testing, start the existing VAD debug UI, select an input, and
+speak until a user turn starts. Enter text in **Inject mock transcript**, send
+one or more partials and then a final. Stop speaking: the dashboard shows
+`AWAITING_COMMIT` / `WAITING`, then `COMMITTED` after the endpoint timeout.
+The equivalent development endpoint is `POST /api/mock-transcript` with JSON
+`{"text":"hello ghostpilot","is_final":true}`; it is only available when
+the active provider is `MockSTTProvider`.
 
 ## Required Tests
 

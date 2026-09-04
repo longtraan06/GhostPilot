@@ -12,6 +12,7 @@ class MockSTTProvider:
     def __init__(self) -> None:
         self._events: asyncio.Queue[STTEvent | None] = asyncio.Queue()
         self.connected = False
+        self.audio_frames: list[bytes] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -19,9 +20,10 @@ class MockSTTProvider:
     async def send_audio(self, audio: bytes) -> None:
         if not self.connected:
             raise RuntimeError("STT provider is not connected")
+        self.audio_frames.append(audio)
 
-    async def emit(self, text: str, *, is_final: bool) -> None:
-        await self._events.put(STTEvent(text, is_final))
+    async def emit(self, text: str, *, is_final: bool, turn_id: str | None = None) -> None:
+        await self._events.put(STTEvent(text, is_final, turn_id))
 
     async def events(self) -> AsyncIterator[STTEvent]:
         while (event := await self._events.get()) is not None:

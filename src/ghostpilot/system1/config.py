@@ -17,6 +17,7 @@ class AudioConfig:
     frame_duration_ms: int = 20
     queue_size: int = 50
     turn_buffer_seconds: float = 30.0
+    pre_roll_ms: int = 250
 
     def __post_init__(self) -> None:
         if self.sample_rate != 16_000 or self.channels != 1:
@@ -25,6 +26,8 @@ class AudioConfig:
             raise ValueError("frame_duration_ms must stay in the realtime range (10-60 ms)")
         if self.queue_size < 1 or self.turn_buffer_seconds <= 0:
             raise ValueError("audio queue and turn buffer limits must be positive")
+        if not self.frame_duration_ms <= self.pre_roll_ms <= 1_000:
+            raise ValueError("pre_roll_ms must be at least one frame and no more than one second")
 
     @property
     def samples_per_frame(self) -> int:
@@ -39,12 +42,23 @@ class VADConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EndpointConfig:
+    endpoint_timeout_ms: int = 600
+    require_final_transcript: bool = True
+
+    def __post_init__(self) -> None:
+        if not 100 <= self.endpoint_timeout_ms <= 5_000:
+            raise ValueError("endpoint_timeout_ms must be between 100 and 5000")
+
+
+@dataclass(frozen=True, slots=True)
 class System1Config:
     stt_provider: str = "mock.stt"
     dialogue_provider: str = "mock.dialogue"
     tts_provider: str = "mock.tts"
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
+    endpoint: EndpointConfig = field(default_factory=EndpointConfig)
 
 
 T = TypeVar("T")
