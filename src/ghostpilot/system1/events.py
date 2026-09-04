@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
 
@@ -16,6 +16,22 @@ class AudioSpeechStarted:
 class AudioSpeechStopped:
     turn_id: str
     name: Literal["audio.speech_stopped"] = "audio.speech_stopped"
+
+
+@dataclass(frozen=True, slots=True)
+class AudioInputStarted:
+    name: Literal["audio.input_started"] = "audio.input_started"
+
+
+@dataclass(frozen=True, slots=True)
+class AudioInputStopped:
+    name: Literal["audio.input_stopped"] = "audio.input_stopped"
+
+
+@dataclass(frozen=True, slots=True)
+class AudioFrameDropped:
+    dropped_frames: int
+    name: Literal["audio.frame_dropped"] = "audio.frame_dropped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +101,9 @@ class ProviderFailed:
 DomainEvent: TypeAlias = (
     AudioSpeechStarted
     | AudioSpeechStopped
+    | AudioInputStarted
+    | AudioInputStopped
+    | AudioFrameDropped
     | ConversationTurnStarted
     | ConversationTurnCommitted
     | ConversationAssistantSpeaking

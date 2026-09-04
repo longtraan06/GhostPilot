@@ -19,7 +19,7 @@ from .events import (
 from .interruption import InterruptionController
 from .providers import DialogueProvider, Playback, TTSProvider
 from .speech import SpeechSegmenter
-from .state import AssistantState, ConversationState
+from .state import AssistantState, ConversationState, TurnState
 
 
 class TurnManager:
@@ -39,6 +39,14 @@ class TurnManager:
         self._response_task: asyncio.Task[None] | None = None
 
     async def user_speech_started(self) -> str:
+        if self.state.turn_state is TurnState.AWAITING_COMMIT:
+            turn_id = self.state.current_turn
+            if turn_id is None:
+                raise RuntimeError("an endpoint-waiting state requires a current turn")
+            self.state.resume_user_speech()
+            await self.events.publish(AudioSpeechStarted(turn_id))
+            return turn_id
+
         self._turn_number += 1
         turn_id = f"turn-{self._turn_number}"
         if self.state.assistant_state in {AssistantState.THINKING, AssistantState.SPEAKING}:
@@ -49,11 +57,17 @@ class TurnManager:
         await self.events.publish(ConversationTurnStarted(turn_id))
         return turn_id
 
-    async def user_speech_stopped(self, transcript: str) -> None:
+    async def user_speech_stopped(self) -> None:
         turn_id = self.state.current_turn
         if turn_id is None:
             raise RuntimeError("cannot stop speech without a turn")
         await self.events.publish(AudioSpeechStopped(turn_id))
+        self.state.stop_user_speech()
+
+    async def commit_turn(self, transcript: str) -> None:
+        turn_id = self.state.current_turn
+        if turn_id is None:
+            raise RuntimeError("cannot commit without a turn")
         self.state.commit_turn(transcript)
         await self.events.publish(ConversationTurnCommitted(turn_id, transcript))
         self._response_task = asyncio.create_task(self._respond(turn_id, transcript))

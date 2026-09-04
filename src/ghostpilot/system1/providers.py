@@ -43,4 +43,5 @@ class TTSProvider(Protocol):
 
 class Playback(Protocol):
     async def play(self, audio: AudioChunk) -> None: ...
-    def stop_now(self) -> None: ...
+    def stop_now(self) -> None:
+        """Stop only current playback; a later ``play`` call must still be accepted."""

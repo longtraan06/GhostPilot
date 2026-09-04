@@ -130,6 +130,69 @@ Implement only:
 
 No real STT or TTS API yet.
 
+## Milestone 2: local microphone and VAD
+
+### Canonical audio format
+
+System 1 accepts microphone audio only as `AudioFrame` objects in this format:
+
+- 16,000 Hz sample rate
+- one channel (mono)
+- signed PCM16 / `int16`
+- 20 ms frames by default (configurable to a nearby fixed duration)
+
+`AudioInput` is a vendor-neutral asynchronous source with `start()`, `frames()`,
+and `close()`. The optional `SoundDeviceAudioInput` adapter owns all
+`sounddevice`/PortAudio code and normalizes captured input to that format.
+It captures at the selected device's native sample rate, downmixes to mono, and
+resamples each fixed frame to 16 kHz before it reaches the realtime runtime.
+Frames travel directly through the realtime audio loop; they never pass through
+the general `EventBus`.
+
+### VAD and endpointing
+
+`VoiceActivityDetector` only produces acoustic `SPEECH_STARTED` and
+`SPEECH_STOPPED` signals. The default local implementation is a lightweight
+energy detector with configurable speech threshold, minimum speech duration,
+and minimum silence duration. It can be replaced by a Silero adapter without
+changing runtime or turn-management code.
+
+VAD stop is not endpoint detection. A speech stop moves the conversation to
+`AWAITING_COMMIT`, emits `audio.speech_stopped`, and retains its audio. Only a
+future endpoint detector may call `System1Runtime.commit_turn(transcript)`.
+
+### Buffer lifecycle
+
+`TurnAudioBuffer` keeps bounded PCM frames for the active, uncommitted user
+turn. Short VAD pauses resume the same buffer; a new user turn creates a new
+buffer. Milestone 3's STT adapter will consume the buffer snapshot or stream
+from this same ownership boundary. When its duration limit is exceeded, the
+oldest frames are dropped deterministically and counted.
+
+### VAD debug UI
+
+The development-only FastAPI/WebSocket UI displays backend-produced VAD state,
+audio level, probability, System 1 turn state, semantic events, and small
+buffer/queue metrics. It does not run browser VAD or send microphone PCM to the
+browser.
+
+Install the optional local dependencies, then run:
+
+```bash
+pip install -e ".[audio,vad-debug]"
+python -m ghostpilot.system1.vad_debug
+```
+
+Open `http://127.0.0.1:8000`. Use `--device`, `--threshold`, or `--port` when
+needed. Run `python -m ghostpilot.system1.vad_debug --list-devices` to show
+available microphones, then pass its numeric ID with `--device ID`. Remain
+silent to observe `LISTENING`; speak to observe `SPEAKING`; stop to observe
+endpoint-waiting behavior without dialogue generation.
+
+The dashboard also has an **Input device** dropdown. It lists only devices with
+input channels; choosing one and pressing **Use selected input** swaps the
+running `AudioInput` adapter while keeping the System 1 runtime alive.
+
 ## Required Tests
 
 Normal flow:

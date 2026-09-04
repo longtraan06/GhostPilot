@@ -23,10 +23,20 @@ class System1LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await runtime.start()
 
         await runtime.on_user_speech_started()
-        await runtime.on_user_speech_stopped("find it")
+        await runtime.on_user_speech_stopped()
+        self.assertEqual(runtime.state.turn_state, TurnState.AWAITING_COMMIT)
+        self.assertTrue(events.empty() is False)
+        seen_before_commit = []
+        while not events.empty():
+            seen_before_commit.append((await events.get()).name)
+        self.assertIn("audio.speech_stopped", seen_before_commit)
+        self.assertNotIn("conversation.turn_committed", seen_before_commit)
+        self.assertNotIn("generation.started", seen_before_commit)
+
+        await runtime.commit_turn("find it")
         await runtime.wait_for_response()
 
-        seen = []
+        seen = seen_before_commit
         while not events.empty():
             seen.append((await events.get()).name)
         self.assertEqual(runtime.state.turn_state, TurnState.LISTENING)
@@ -46,7 +56,8 @@ class System1LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await runtime.start()
 
         await runtime.on_user_speech_started()
-        await runtime.on_user_speech_stopped("say something")
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("say something")
         await asyncio.sleep(0.08)  # Dialogue yielded; streaming TTS is active.
         self.assertEqual(runtime.state.turn_state, TurnState.ASSISTANT_SPEAKING)
 
@@ -62,4 +73,29 @@ class System1LifecycleTests(unittest.IsolatedAsyncioTestCase):
             seen.append((await events.get()).name)
         self.assertIn("conversation.interrupted", seen)
         self.assertIn("generation.cancelled", seen)
+        await runtime.close()
+
+    async def test_playback_recovers_for_response_after_barge_in(self) -> None:
+        dialogue = MockDialogueProvider([DialogueOutput("A fresh response.")], delay=0.05)
+        tts = MockTTSProvider(delay=0.2)
+        playback = MockPlayback()
+        runtime = System1Runtime(dialogue=dialogue, tts=tts, playback=playback)
+        await runtime.start()
+
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("first request")
+        await asyncio.sleep(0.08)
+        self.assertEqual(runtime.state.turn_state, TurnState.ASSISTANT_SPEAKING)
+
+        await runtime.on_user_speech_started()
+        self.assertTrue(playback.stopped)
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("replacement request")
+        await runtime.wait_for_response()
+
+        self.assertTrue(playback.played)
+        self.assertEqual(playback.played[-1].data, b"A fresh response.")
+        self.assertFalse(playback.stopped)
+        self.assertEqual(runtime.state.turn_state, TurnState.LISTENING)
         await runtime.close()

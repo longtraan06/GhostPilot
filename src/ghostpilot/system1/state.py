@@ -21,6 +21,7 @@ class AssistantState(str, Enum):
 class TurnState(str, Enum):
     LISTENING = "LISTENING"
     USER_SPEAKING = "USER_SPEAKING"
+    AWAITING_COMMIT = "AWAITING_COMMIT"
     THINKING = "THINKING"
     ASSISTANT_SPEAKING = "ASSISTANT_SPEAKING"
     INTERRUPTED = "INTERRUPTED"
@@ -49,13 +50,25 @@ class ConversationState:
         self.turn_state = TurnState.USER_SPEAKING
 
     def commit_turn(self, transcript: str) -> None:
-        if self.user_state is not UserState.SPEAKING:
-            raise RuntimeError("cannot commit without an active user turn")
+        if self.turn_state is not TurnState.AWAITING_COMMIT:
+            raise RuntimeError("cannot commit until endpoint detection commits the stopped turn")
         self.user_state = UserState.IDLE
         self.committed_transcript = transcript
         self.assistant_state = AssistantState.THINKING
         self.active_generation = self.current_turn
         self.turn_state = TurnState.THINKING
+
+    def stop_user_speech(self) -> None:
+        if self.user_state is not UserState.SPEAKING:
+            raise RuntimeError("cannot stop speech without an active user turn")
+        self.user_state = UserState.IDLE
+        self.turn_state = TurnState.AWAITING_COMMIT
+
+    def resume_user_speech(self) -> None:
+        if self.turn_state is not TurnState.AWAITING_COMMIT:
+            raise RuntimeError("can only resume a user turn awaiting endpoint detection")
+        self.user_state = UserState.SPEAKING
+        self.turn_state = TurnState.USER_SPEAKING
 
     def begin_assistant_speech(self) -> None:
         if self.assistant_state is not AssistantState.THINKING:

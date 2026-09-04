@@ -37,8 +37,10 @@ class MockDialogueProvider:
         self.responses = list(responses or [DialogueOutput("Okay. I am ready to help.")])
         self.delay = delay
         self.cancelled = False
+        self.stream_calls = 0
 
     async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+        self.stream_calls += 1
         self.cancelled = False
         for response in self.responses:
             if self.delay:
@@ -55,8 +57,10 @@ class MockTTSProvider:
     def __init__(self, *, delay: float = 0) -> None:
         self.delay = delay
         self.cancelled = False
+        self.stream_calls = 0
 
     async def stream(self, text: str) -> AsyncIterator[AudioChunk]:
+        self.stream_calls += 1
         self.cancelled = False
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -73,8 +77,9 @@ class MockPlayback:
         self.stopped = False
 
     async def play(self, audio: AudioChunk) -> None:
-        if not self.stopped:
-            self.played.append(audio)
+        # A new stream owns a fresh playback buffer after a previous stop.
+        self.stopped = False
+        self.played.append(audio)
 
     def stop_now(self) -> None:
         self.stopped = True
