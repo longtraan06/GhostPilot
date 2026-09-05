@@ -4,7 +4,7 @@ import unittest
 import wave
 
 from ghostpilot.system1.audio import AudioFrame
-from ghostpilot.system1.vad_debug import MicrophoneTestRecorder
+from ghostpilot.system1.vad_debug import MicrophoneTestRecorder, PAGE
 
 
 def audio_frame(data: bytes) -> AudioFrame:
@@ -17,6 +17,12 @@ def audio_frame(data: bytes) -> AudioFrame:
 
 
 class MicrophoneTestRecorderTests(unittest.TestCase):
+    def test_dashboard_exposes_reconnect_recovery_and_absolute_deadline(self) -> None:
+        self.assertIn('id="recoveryBadge"', PAGE)
+        self.assertIn("ACTIVE TURN INVALIDATED DUE TO STT RECONNECT", PAGE)
+        self.assertIn('id="endpointDeadline"', PAGE)
+        self.assertIn("endpoint_deadline_monotonic", PAGE)
+
     def test_canonical_frames_are_returned_as_playable_wav(self) -> None:
         recorder = MicrophoneTestRecorder()
         recorder.start(1)
@@ -49,4 +55,3 @@ class MicrophoneTestRecorderTests(unittest.TestCase):
         recorder.start(1)
         with self.assertRaises(RuntimeError):
             recorder.start(1)
-

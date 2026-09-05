@@ -73,6 +73,8 @@ class System1Runtime:
         self._endpoint_task: asyncio.Task[None] | None = None
         self._endpoint_generation = 0
         self._endpoint_deadline: float | None = None
+        self._endpoint_deadline_turn_id: str | None = None
+        self._endpoint_deadline_segment_id: int | None = None
         self._started = False
         self._audio_level = 0.0
         self._reported_dropped_frames = 0
@@ -83,6 +85,12 @@ class System1Runtime:
         self._turn_commit_latency_ms: float | None = None
         self._last_stt_response_at: float | None = None
         self._last_committed_turn_id: str | None = None
+        self._last_audio_frame: AudioFrame | None = None
+        self._last_segment_stop_sequence: int | None = None
+        self._last_segment_stop_timestamp: float | None = None
+        self._active_stt_generation: int | None = None
+        self._stt_turn_invalidated = False
+        self._stt_invalidation_detail = ""
         self._latency_history: deque[dict[str, object]] = deque(maxlen=10)
         self._audio_frame_observer: Callable[[AudioFrame], None] | None = None
         self.transcripts = TranscriptManager()
@@ -180,6 +188,12 @@ class System1Runtime:
         else:
             self.transcripts.reset(turn_id)
         await self.stt.start_segment(turn_id, self.transcripts.segment_id)
+        provider_generation = self.stt.diagnostics().get("connection_generation")
+        self._active_stt_generation = (
+            provider_generation if isinstance(provider_generation, int) else None
+        )
+        self._stt_turn_invalidated = False
+        self._stt_invalidation_detail = ""
         self._speech_started_at = asyncio.get_running_loop().time()
         self._speech_stopped_at = None
         self._first_partial_latency_ms = None
@@ -190,12 +204,24 @@ class System1Runtime:
                 turn_id, maximum_seconds=self.config.audio.turn_buffer_seconds
             )
             self.turn_audio_buffer.extend(self.pre_roll_buffer.snapshot())
+            self._last_segment_stop_sequence = None
+            self._last_segment_stop_timestamp = None
         return turn_id
 
-    async def on_user_speech_stopped(self) -> None:
+    async def on_user_speech_stopped(self, boundary_frame: AudioFrame | None = None) -> None:
         """Record a VAD boundary; endpoint detection decides when to commit."""
         await self.turns.user_speech_stopped()
-        self._speech_stopped_at = asyncio.get_running_loop().time()
+        boundary_frame = boundary_frame or self._last_audio_frame
+        if boundary_frame is not None:
+            self._last_segment_stop_sequence = boundary_frame.sequence
+            self._last_segment_stop_timestamp = boundary_frame.timestamp
+        now = asyncio.get_running_loop().time()
+        self._speech_stopped_at = now
+        self._endpoint_deadline = (
+            now + self.config.endpoint.endpoint_timeout_ms / 1_000
+        )
+        self._endpoint_deadline_turn_id = self.state.current_turn
+        self._endpoint_deadline_segment_id = self.transcripts.segment_id
         await self.stt.end_segment()
         await self._schedule_endpoint(self.state.current_turn)
 
@@ -220,6 +246,7 @@ class System1Runtime:
     async def _run_audio_loop(self) -> None:
         assert self.audio_input is not None and self.vad is not None
         async for frame in self.audio_input.frames():
+            self._last_audio_frame = frame
             if self._audio_frame_observer is not None:
                 self._audio_frame_observer(frame)
             # Pre-roll is populated before VAD sees the frame, so a new turn
@@ -235,17 +262,27 @@ class System1Runtime:
             self._audio_level = pcm16_rms_level(frame)
             vad_event = self.vad.process(frame)
             if vad_event and vad_event.kind is VADEventKind.SPEECH_STARTED:
+                resuming = self.state.turn_state is TurnState.AWAITING_COMMIT
                 await self.on_user_speech_started()
                 # Gate inference to speech, but prepend the bounded audio that
                 # VAD needed in order to make its start decision.
-                for pre_roll_frame in self.pre_roll_buffer.snapshot():
+                pre_roll_frames = self._pre_roll_for_segment(resuming=resuming)
+                if resuming:
+                    logger.info(
+                        "Resumed STT segment pre-roll selected: %s frames",
+                        len(pre_roll_frames),
+                    )
+                for pre_roll_frame in pre_roll_frames:
                     await self.stt.send_audio(pre_roll_frame.data)
             elif was_speaking:
                 # send_audio is a bounded queue offer for real adapters; it
                 # never performs network I/O on this runtime path.
                 await self.stt.send_audio(frame.data)
             if vad_event and vad_event.kind is VADEventKind.SPEECH_STOPPED:
-                await self.on_user_speech_stopped()
+                # A disconnect can abort the turn while VAD remains in its
+                # current acoustic state. Its eventual stop is not a turn stop.
+                if self.state.turn_state is TurnState.USER_SPEAKING:
+                    await self.on_user_speech_stopped(frame)
             await self._report_input_drops()
 
     async def _run_stt_loop(self) -> None:
@@ -263,6 +300,8 @@ class System1Runtime:
                     await self.events.publish(
                         ProviderFailed(self.config.stt_provider, event.detail)
                     )
+                if event.status == "disconnected":
+                    await self._recover_from_stt_disconnect(event)
             else:
                 await self._apply_stt_event(event)
 
@@ -288,8 +327,25 @@ class System1Runtime:
             await self.events.publish(
                 TranscriptFinal(turn_id, event.text, self.transcripts.segment_id)
             )
-            if self.state.turn_state is TurnState.AWAITING_COMMIT and self.endpoint_state is not EndpointState.WAITING:
-                await self._schedule_endpoint(turn_id)
+            if self.state.turn_state is TurnState.AWAITING_COMMIT:
+                if not self._deadline_matches(turn_id, self.transcripts.segment_id):
+                    return
+                deadline = self._endpoint_deadline
+                if deadline is not None and now >= deadline:
+                    logger.info(
+                        "STT final arrived after original endpoint deadline",
+                        extra={"turn_id": turn_id, "segment_id": event.segment_id},
+                    )
+                    committed = await self._evaluate_endpoint(
+                        turn_id, self.transcripts.segment_id, self._endpoint_generation
+                    )
+                    if committed:
+                        logger.info(
+                            "Endpoint committed immediately after late final",
+                            extra={"turn_id": turn_id, "segment_id": event.segment_id},
+                        )
+                elif self.endpoint_state is not EndpointState.WAITING:
+                    await self._schedule_endpoint(turn_id)
         else:
             if self._first_partial_latency_ms is None and self._speech_started_at is not None:
                 self._first_partial_latency_ms = round(
@@ -300,22 +356,20 @@ class System1Runtime:
             )
 
     async def _schedule_endpoint(self, turn_id: str | None) -> None:
-        if turn_id is None:
+        if turn_id is None or not self._deadline_matches(turn_id, self.transcripts.segment_id):
             return
-        await self._cancel_pending_endpoint()
+        await self._cancel_pending_endpoint(clear_deadline=False)
         self._endpoint_generation += 1
         generation = self._endpoint_generation
         segment_id = self.transcripts.segment_id
         self.endpoint_state = EndpointState.WAITING
-        self._endpoint_deadline = (
-            asyncio.get_running_loop().time()
-            + self.config.endpoint.endpoint_timeout_ms / 1_000
-        )
+        assert self._endpoint_deadline is not None
+        remaining = max(0.0, self._endpoint_deadline - asyncio.get_running_loop().time())
         self._endpoint_task = asyncio.create_task(
-            self._endpoint_after_timeout(turn_id, segment_id, generation)
+            self._endpoint_after_timeout(turn_id, segment_id, generation, remaining)
         )
 
-    async def _cancel_pending_endpoint(self) -> None:
+    async def _cancel_pending_endpoint(self, *, clear_deadline: bool = True) -> None:
         self._endpoint_generation += 1
         task, self._endpoint_task = self._endpoint_task, None
         if task and task is not asyncio.current_task():
@@ -324,36 +378,48 @@ class System1Runtime:
                 await task
         if self.endpoint_state is not EndpointState.COMMITTED:
             self.endpoint_state = EndpointState.IDLE
-        self._endpoint_deadline = None
+        if clear_deadline:
+            self._clear_endpoint_deadline()
 
     async def _endpoint_after_timeout(
-        self, turn_id: str, segment_id: int, generation: int
+        self, turn_id: str, segment_id: int, generation: int, delay_seconds: float
     ) -> None:
         try:
-            await asyncio.sleep(self.config.endpoint.endpoint_timeout_ms / 1_000)
-            if (
-                generation != self._endpoint_generation
-                or turn_id != self.state.current_turn
-                or self.state.turn_state is not TurnState.AWAITING_COMMIT
-                or turn_id != self.transcripts.turn_id
-                or segment_id != self.transcripts.segment_id
-            ):
-                return
-            transcript = self.transcripts.snapshot()
-            if self.endpoint_detector.should_commit(transcript):
-                await self._commit_turn(transcript.commit_text)
-                self.endpoint_state = EndpointState.COMMITTED
-            else:
-                self.endpoint_state = EndpointState.IDLE
+            await asyncio.sleep(delay_seconds)
+            await self._evaluate_endpoint(turn_id, segment_id, generation)
         finally:
             if self._endpoint_task is asyncio.current_task():
                 self._endpoint_task = None
-                self._endpoint_deadline = None
+
+    async def _evaluate_endpoint(
+        self, turn_id: str, segment_id: int, generation: int
+    ) -> bool:
+        if (
+            generation != self._endpoint_generation
+            or not self._deadline_matches(turn_id, segment_id)
+            or turn_id != self.state.current_turn
+            or self.state.turn_state is not TurnState.AWAITING_COMMIT
+            or turn_id != self.transcripts.turn_id
+            or segment_id != self.transcripts.segment_id
+        ):
+            return False
+        transcript = self.transcripts.snapshot()
+        if self.endpoint_detector.should_commit(transcript):
+            await self._commit_turn(transcript.commit_text)
+            self.endpoint_state = EndpointState.COMMITTED
+            self._clear_endpoint_deadline()
+            return True
+        else:
+            # Keep the expired absolute boundary so a late final can be
+            # evaluated immediately instead of receiving a new full timeout.
+            self.endpoint_state = EndpointState.IDLE
+            return False
 
     async def _commit_turn(self, transcript: str) -> None:
         turn_id = self.state.current_turn
         await self.turns.commit_turn(transcript)
         await self.stt.commit_turn()
+        self._active_stt_generation = None
         self._last_committed_turn_id = turn_id
         if self._speech_stopped_at is not None:
             self._turn_commit_latency_ms = round(
@@ -369,6 +435,59 @@ class System1Runtime:
             }
         )
         logger.info("System 1 turn committed", extra={"turn_id": turn_id})
+
+    def _pre_roll_for_segment(self, *, resuming: bool) -> tuple[AudioFrame, ...]:
+        frames = self.pre_roll_buffer.snapshot()
+        if not resuming:
+            return frames
+        stop_sequence = self._last_segment_stop_sequence
+        stop_timestamp = self._last_segment_stop_timestamp
+        if stop_sequence is not None and stop_sequence > 0:
+            return tuple(frame for frame in frames if frame.sequence > stop_sequence)
+        if stop_timestamp is not None:
+            return tuple(frame for frame in frames if frame.timestamp > stop_timestamp)
+        return frames
+
+    def _deadline_matches(self, turn_id: str, segment_id: int) -> bool:
+        return (
+            self._endpoint_deadline is not None
+            and self._endpoint_deadline_turn_id == turn_id
+            and self._endpoint_deadline_segment_id == segment_id
+        )
+
+    def _clear_endpoint_deadline(self) -> None:
+        self._endpoint_deadline = None
+        self._endpoint_deadline_turn_id = None
+        self._endpoint_deadline_segment_id = None
+
+    async def _recover_from_stt_disconnect(self, event: STTServiceEvent) -> None:
+        if self.state.turn_state not in {TurnState.USER_SPEAKING, TurnState.AWAITING_COMMIT}:
+            return
+        if (
+            self._active_stt_generation is not None
+            and event.connection_generation != self._active_stt_generation
+        ):
+            return
+        turn_id = self.state.current_turn
+        detail = (
+            "ACTIVE TURN INVALIDATED DUE TO STT RECONNECT "
+            f"(connection generation {event.connection_generation})"
+        )
+        logger.warning(
+            "Active turn invalidated because STT connection changed: turn=%s generation=%s",
+            turn_id,
+            event.connection_generation,
+        )
+        await self._cancel_pending_endpoint()
+        await self.turns.abort_user_turn(detail, event.connection_generation)
+        self.transcripts.clear()
+        self.turn_audio_buffer = None
+        self._active_stt_generation = None
+        self._last_segment_stop_sequence = None
+        self._last_segment_stop_timestamp = None
+        self._stt_turn_invalidated = True
+        self._stt_invalidation_detail = detail
+        await self.stt.reset()
 
     async def _report_input_drops(self) -> None:
         if self.audio_input is None:
@@ -419,7 +538,12 @@ class System1Runtime:
             "endpoint_state": self.endpoint_state.value,
             "endpoint_pending": self._endpoint_task is not None and not self._endpoint_task.done(),
             "endpoint_remaining_ms": endpoint_remaining_ms,
+            "endpoint_deadline_monotonic": self._endpoint_deadline,
+            "endpoint_deadline_turn_id": self._endpoint_deadline_turn_id,
+            "endpoint_deadline_segment_id": self._endpoint_deadline_segment_id,
             "turn_committed": self._last_committed_turn_id == self.state.current_turn,
+            "stt_turn_invalidated": self._stt_turn_invalidated,
+            "stt_invalidation_detail": self._stt_invalidation_detail,
             "stt": provider,
             "latency": {
                 "speech_start_to_first_partial_ms": self._first_partial_latency_ms,

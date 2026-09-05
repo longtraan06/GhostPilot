@@ -266,6 +266,49 @@ class MockSTTEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dialogue.stream_calls, 0)
         await runtime.close()
 
+    async def test_late_final_after_original_deadline_commits_immediately(self) -> None:
+        stt = MockSTTProvider()
+        dialogue = MockDialogueProvider([DialogueOutput("Done.")], delay=0.2)
+        runtime = System1Runtime(stt=stt, dialogue=dialogue, config=endpoint_config())
+        await runtime.start()
+        turn_id = await runtime.on_user_speech_started()
+        segment_id = runtime.transcripts.segment_id
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.13)
+        self.assertEqual(runtime.endpoint_state, EndpointState.IDLE)
+
+        final_arrived_at = asyncio.get_running_loop().time()
+        await stt.emit(
+            "late but valid", is_final=True, turn_id=turn_id, segment_id=segment_id
+        )
+        await wait_until(lambda: dialogue.stream_calls == 1)
+
+        self.assertLess(asyncio.get_running_loop().time() - final_arrived_at, 0.06)
+        self.assertEqual(runtime.state.committed_transcript, "late but valid")
+        await runtime.wait_for_response()
+        await runtime.close()
+
+    async def test_early_final_waits_only_for_original_stop_deadline(self) -> None:
+        stt = MockSTTProvider()
+        dialogue = MockDialogueProvider([DialogueOutput("Done.")], delay=0.2)
+        runtime = System1Runtime(stt=stt, dialogue=dialogue, config=endpoint_config())
+        await runtime.start()
+        turn_id = await runtime.on_user_speech_started()
+        segment_id = runtime.transcripts.segment_id
+        stopped_at = asyncio.get_running_loop().time()
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.03)
+        await stt.emit(
+            "ready before deadline", is_final=True, turn_id=turn_id, segment_id=segment_id
+        )
+        await wait_until(lambda: dialogue.stream_calls == 1)
+
+        elapsed = asyncio.get_running_loop().time() - stopped_at
+        self.assertGreaterEqual(elapsed, 0.09)
+        self.assertLess(elapsed, 0.16)
+        await runtime.wait_for_response()
+        await runtime.close()
+
     async def test_stale_endpoint_timer_cannot_commit_after_resume(self) -> None:
         stt = MockSTTProvider()
         dialogue = MockDialogueProvider()

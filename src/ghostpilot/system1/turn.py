@@ -9,6 +9,7 @@ from .events import (
     AudioSpeechStarted,
     AudioSpeechStopped,
     ConversationAssistantSpeaking,
+    ConversationTurnAborted,
     ConversationTurnCommitted,
     ConversationTurnStarted,
     DialogueActionProposed,
@@ -71,6 +72,14 @@ class TurnManager:
         self.state.commit_turn(transcript)
         await self.events.publish(ConversationTurnCommitted(turn_id, transcript))
         self._response_task = asyncio.create_task(self._respond(turn_id, transcript))
+
+    async def abort_user_turn(self, reason: str, connection_generation: int = 0) -> str:
+        """Return safely to listening without committing or starting dialogue."""
+        turn_id = self.state.abort_user_turn()
+        await self.events.publish(
+            ConversationTurnAborted(turn_id, reason, connection_generation)
+        )
+        return turn_id
 
     async def wait_for_response(self) -> None:
         if self._response_task:

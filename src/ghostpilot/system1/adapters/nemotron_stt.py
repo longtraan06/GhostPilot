@@ -6,9 +6,10 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 import json
 import logging
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.request import urlopen
 
 from ..config import NemotronSTTConfig
@@ -26,6 +27,16 @@ class WebSocketLike(Protocol):
 
 ConnectFactory = Callable[[str], Awaitable[WebSocketLike]]
 HealthFetcher = Callable[[str], Awaitable[dict[str, Any]]]
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundMessage:
+    """One ordered WebSocket write with its System 1 ownership metadata."""
+
+    kind: Literal["audio", "control"]
+    payload: bytes | str
+    turn_id: str | None
+    segment_id: int | None
 
 
 async def _default_connect(url: str) -> WebSocketLike:
@@ -60,9 +71,12 @@ class NemotronSTTProvider:
         self.config = config or NemotronSTTConfig()
         self._connect_factory = connect_factory or _default_connect
         self._health_fetcher = health_fetcher or _default_health_fetch
-        self._send_queue: asyncio.Queue[bytes | str] = asyncio.Queue(
-            self.config.send_queue_size
-        )
+        self._send_queue: deque[OutboundMessage] = deque()
+        self._send_condition = asyncio.Condition()
+        # Controls are rare and get reserved bounded headroom. Audio remains
+        # limited by send_queue_size and is the only traffic dropped on pressure.
+        self._send_queue_capacity = self.config.send_queue_size + 8
+        self._queued_audio_frames = 0
         self._events: asyncio.Queue[STTProviderEvent | None] = asyncio.Queue(128)
         self._socket: WebSocketLike | None = None
         self._supervisor_task: asyncio.Task[None] | None = None
@@ -114,13 +128,22 @@ class NemotronSTTProvider:
     async def send_audio(self, audio: bytes) -> None:
         if not audio:
             return
-        if self._send_queue.full():
-            self._dropped_frames += 1
-            self._trace_event("audio dropped: send queue full")
-            return
-        self._send_queue.put_nowait(audio)
-        self._segment_frames_queued += 1
-        self._segment_bytes_queued += len(audio)
+        async with self._send_condition:
+            if (
+                self._queued_audio_frames >= self.config.send_queue_size
+                or len(self._send_queue) >= self._send_queue_capacity
+            ):
+                self._record_audio_drop("send queue full")
+                return
+            self._send_queue.append(
+                OutboundMessage(
+                    "audio", audio, self._active_turn_id, self._active_segment_id
+                )
+            )
+            self._queued_audio_frames += 1
+            self._segment_frames_queued += 1
+            self._segment_bytes_queued += len(audio)
+            self._send_condition.notify()
 
     async def start_segment(self, turn_id: str, segment_id: int) -> None:
         self._active_turn_id = turn_id
@@ -151,7 +174,7 @@ class NemotronSTTProvider:
     async def reset(self) -> None:
         self._active_turn_id = None
         self._active_segment_id = None
-        self._discard_send_queue()
+        await self._discard_send_queue("explicit reset")
         await self._enqueue_control("reset")
         await self._emit_service("reset", "STT session reset requested")
         logger.info("STT reset queued")
@@ -195,8 +218,9 @@ class NemotronSTTProvider:
             "last_error": self._last_error,
             "frames_sent": self._frames_sent,
             "audio_bytes_sent": self._audio_bytes_sent,
-            "send_queue_depth": self._send_queue.qsize(),
-            "send_queue_capacity": self.config.send_queue_size,
+            "send_queue_depth": len(self._send_queue),
+            "send_queue_capacity": self._send_queue_capacity,
+            "audio_queue_capacity": self.config.send_queue_size,
             "stt_dropped_frames": self._dropped_frames,
             "latest_response_age_ms": response_age_ms,
             "latest_audio_send_age_ms": audio_send_age_ms,
@@ -234,6 +258,8 @@ class NemotronSTTProvider:
         self._connected = False
         self._ready = False
         self._ready_event.clear()
+        async with self._send_condition:
+            self._send_condition.notify_all()
         if self._events.full():
             with suppress(asyncio.QueueEmpty):
                 self._events.get_nowait()
@@ -267,6 +293,10 @@ class NemotronSTTProvider:
                 await socket.send(json.dumps({"type": "reset"}))
                 self._last_control_sent = "reset"
                 self._trace_event("control sent: reset (connection initialization)")
+                logger.info(
+                    "STT control sent: reset (connection initialization, generation=%s)",
+                    generation,
+                )
                 sender = asyncio.create_task(self._send_loop(socket, generation))
                 receiver = asyncio.create_task(self._receive_loop(socket, generation))
                 try:
@@ -297,7 +327,9 @@ class NemotronSTTProvider:
                 self._ready = False
                 self._ready_event.clear()
                 self._socket = None
-                self._discard_send_queue()
+                self._active_turn_id = None
+                self._active_segment_id = None
+                await self._discard_send_queue("connection changed")
                 await self._emit_service("disconnected", self._last_error)
                 logger.info("STT connection closed")
             if not self._closed:
@@ -306,13 +338,27 @@ class NemotronSTTProvider:
 
     async def _send_loop(self, socket: WebSocketLike, generation: int) -> None:
         while generation == self._connection_generation and not self._closed:
-            message = await self._send_queue.get()
-            await socket.send(message)
-            if isinstance(message, bytes):
+            async with self._send_condition:
+                while not self._send_queue and not self._closed:
+                    await self._send_condition.wait()
+                if self._closed:
+                    return
+                outbound = self._send_queue.popleft()
+                if outbound.kind == "audio":
+                    self._queued_audio_frames -= 1
+                self._send_condition.notify_all()
+            await socket.send(outbound.payload)
+            if outbound.kind == "audio":
+                message = outbound.payload
+                assert isinstance(message, bytes)
                 self._frames_sent += 1
                 self._audio_bytes_sent += len(message)
-                self._segment_frames_sent += 1
-                self._segment_bytes_sent += len(message)
+                if (
+                    outbound.turn_id == self._active_turn_id
+                    and outbound.segment_id == self._active_segment_id
+                ):
+                    self._segment_frames_sent += 1
+                    self._segment_bytes_sent += len(message)
                 self._last_audio_sent_at = asyncio.get_running_loop().time()
                 if self._segment_frames_sent == 1:
                     self._trace_event(
@@ -322,7 +368,7 @@ class NemotronSTTProvider:
                         "STT first PCM frame sent",
                         extra={
                             "turn_id": self._active_turn_id,
-                            "segment_id": self._active_segment_id,
+                            "segment_id": outbound.segment_id,
                             "bytes": len(message),
                         },
                     )
@@ -332,9 +378,11 @@ class NemotronSTTProvider:
                         self._active_segment_id,
                         self._segment_frames_sent,
                         self._segment_bytes_sent,
-                        self._send_queue.qsize(),
+                        len(self._send_queue),
                     )
             else:
+                message = outbound.payload
+                assert isinstance(message, str)
                 try:
                     control_type = str(json.loads(message).get("type", "unknown"))
                 except (json.JSONDecodeError, AttributeError):
@@ -347,7 +395,7 @@ class NemotronSTTProvider:
                 logger.info(
                     "STT control sent: %s (segment=%s frames=%s bytes=%s)",
                     control_type,
-                    self._active_segment_id,
+                    outbound.segment_id,
                     self._segment_frames_sent,
                     self._segment_bytes_sent,
                 )
@@ -462,21 +510,54 @@ class NemotronSTTProvider:
 
     async def _enqueue_control(self, message_type: str) -> None:
         message = json.dumps({"type": message_type}, separators=(",", ":"))
-        if self._send_queue.full():
-            # Controls must not be dropped behind stale audio. Evict one oldest
-            # queued frame/control so segment and turn ownership remain correct.
-            with suppress(asyncio.QueueEmpty):
-                evicted = self._send_queue.get_nowait()
-                if isinstance(evicted, bytes):
-                    self._dropped_frames += 1
-        self._send_queue.put_nowait(message)
+        async with self._send_condition:
+            while len(self._send_queue) >= self._send_queue_capacity:
+                audio_index = next(
+                    (
+                        index
+                        for index, queued in enumerate(self._send_queue)
+                        if queued.kind == "audio"
+                    ),
+                    None,
+                )
+                if audio_index is not None:
+                    del self._send_queue[audio_index]
+                    self._queued_audio_frames -= 1
+                    self._record_audio_drop(f"evicted for {message_type} control")
+                    break
+                if self._closed:
+                    return
+                await self._send_condition.wait()
+            self._send_queue.append(
+                OutboundMessage(
+                    "control", message, self._active_turn_id, self._active_segment_id
+                )
+            )
+            self._trace_event(f"control queued: {message_type}")
+            logger.info(
+                "STT control queued: %s (turn=%s segment=%s)",
+                message_type,
+                self._active_turn_id,
+                self._active_segment_id,
+            )
+            self._send_condition.notify()
 
-    def _discard_send_queue(self) -> None:
-        while not self._send_queue.empty():
-            with suppress(asyncio.QueueEmpty):
-                message = self._send_queue.get_nowait()
-                if isinstance(message, bytes):
-                    self._dropped_frames += 1
+    async def _discard_send_queue(self, reason: str) -> None:
+        async with self._send_condition:
+            while self._send_queue:
+                message = self._send_queue.popleft()
+                if message.kind == "audio":
+                    self._queued_audio_frames -= 1
+                    self._record_audio_drop(f"discarded: {reason}")
+            self._send_condition.notify_all()
+
+    def _record_audio_drop(self, reason: str) -> None:
+        self._dropped_frames += 1
+        self._trace_event(f"audio dropped: {reason}")
+        if self._dropped_frames == 1 or self._dropped_frames % 50 == 0:
+            logger.warning(
+                "STT audio frame dropped: %s (total=%s)", reason, self._dropped_frames
+            )
 
     async def _provider_error(self, detail: str, generation: int) -> None:
         self._last_error = detail

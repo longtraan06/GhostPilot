@@ -52,6 +52,15 @@ class TranscriptManager:
         self._latest_segment_final = False
         self._latest_segment_text = ""
 
+    def clear(self) -> None:
+        """Forget an invalidated turn and reject all delayed provider results."""
+        self._turn_id = None
+        self._partial = ""
+        self._final = ""
+        self._segment_id = 0
+        self._latest_segment_final = False
+        self._latest_segment_text = ""
+
     def start_next_segment(self) -> int:
         """Begin another VAD speech segment without discarding turn history."""
         if self._turn_id is None:

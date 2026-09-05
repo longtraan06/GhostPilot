@@ -89,6 +89,7 @@ Initial event types:
 - audio.speech_stopped
 - conversation.turn_started
 - conversation.turn_committed
+- conversation.turn_aborted
 - conversation.interrupted
 - generation.started
 - generation.cancelled
@@ -313,6 +314,36 @@ essential counters: frames queued/sent for the active segment, last control,
 last response type, partial/final totals, ignored responses, and the exact last
 rejection reason. `PCM SENT · NO TRANSCRIPT RESPONSE` means capture and client
 WebSocket sending succeeded but no partial/final was received for that segment.
+
+Resumed speech uses frame ownership rather than replaying the full pre-roll.
+`AudioFrame.sequence` is the primary boundary: after a speech stop, only frames
+whose sequence is newer than that stop are sent as the next segment's pre-roll.
+The monotonic timestamp is the fallback for synthetic inputs without positive
+sequences. A new user turn still receives the full configured pre-roll.
+
+Endpoint deadlines are absolute and belong to one speech-stop boundary. If the
+timer expires before a final transcript arrives, the deadline remains recorded;
+a valid final for that same turn and segment commits immediately instead of
+starting another 600 ms timer. Speech resumption cancels and invalidates the old
+deadline before the next segment creates a new one.
+
+A WebSocket disconnect invalidates an active `USER_SPEAKING` or
+`AWAITING_COMMIT` turn. System 1 cancels endpointing, emits
+`conversation.turn_aborted`, clears transcript/audio ownership, resets the STT
+adapter, and returns to `LISTENING`. No transcript is committed and no dialogue
+generation starts. Responses on the replacement connection are rejected until
+a fresh user turn binds a new segment.
+
+The outbound adapter uses one bounded, typed FIFO. Audio keeps the configured
+queue limit and may be dropped under backpressure; a small bounded reserve is
+kept for controls. When the total queue is full, a control may evict only the
+oldest audio item, never another control. FIFO placement provides the segment
+barrier: accepted audio before `segment_end` is sent before it, and future
+segment audio is sent after it.
+
+The debug dashboard displays the absolute monotonic endpoint deadline and
+remaining time, connection generation, active STT binding, drop counters, and a
+prominent `ACTIVE TURN INVALIDATED DUE TO STT RECONNECT` recovery indicator.
 
 The adapter currently assumes the service's transcript text follows the
 existing full-turn snapshot contract. A service that returns segment-local text

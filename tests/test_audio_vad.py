@@ -162,6 +162,47 @@ class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tts.stream_calls, 0)
         await runtime.close()
 
+    async def test_resumed_segment_pre_roll_excludes_previous_segment_audio(self) -> None:
+        audio = FakeAudioInput()
+        stt = MockSTTProvider()
+        vad = FakeVAD(
+            [
+                None,
+                None,
+                None,
+                VADEvent(VADEventKind.SPEECH_STARTED),
+                None,
+                VADEvent(VADEventKind.SPEECH_STOPPED),
+                None,
+                VADEvent(VADEventKind.SPEECH_STARTED),
+                None,
+                VADEvent(VADEventKind.SPEECH_STOPPED),
+            ]
+        )
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=vad,
+            stt=stt,
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 11):
+            audio.push(frame(sequence, sequence))
+
+        await wait_until(
+            lambda: audio.queue_size == 0
+            and runtime.state.turn_state is TurnState.AWAITING_COMMIT
+        )
+        sent = [
+            int.from_bytes(item[:2], "little", signed=True)
+            for item in stt.audio_frames
+        ]
+        self.assertEqual(sent, [2, 3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertEqual(sent.count(6), 1)
+        self.assertIn(8, sent)  # resumed speech trigger frame is protected
+        self.assertEqual(stt.segment_starts, [("turn-1", 1), ("turn-1", 2)])
+        await runtime.close()
+
     async def test_speech_start_from_audio_path_emits_event_and_enters_user_speaking(self) -> None:
         audio = FakeAudioInput()
         vad = FakeVAD([None, VADEvent(VADEventKind.SPEECH_STARTED, 0.9)])

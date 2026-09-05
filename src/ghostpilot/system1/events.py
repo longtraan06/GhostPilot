@@ -64,6 +64,14 @@ class ConversationTurnCommitted:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationTurnAborted:
+    turn_id: str
+    reason: str
+    connection_generation: int = 0
+    name: Literal["conversation.turn_aborted"] = "conversation.turn_aborted"
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationAssistantSpeaking:
     turn_id: str
     name: Literal["conversation.assistant_speaking"] = "conversation.assistant_speaking"
@@ -133,6 +141,7 @@ DomainEvent: TypeAlias = (
     | TranscriptFinal
     | ConversationTurnStarted
     | ConversationTurnCommitted
+    | ConversationTurnAborted
     | ConversationAssistantSpeaking
     | ConversationInterrupted
     | GenerationStarted

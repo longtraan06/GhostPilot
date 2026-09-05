@@ -70,6 +70,22 @@ class ConversationState:
         self.user_state = UserState.SPEAKING
         self.turn_state = TurnState.USER_SPEAKING
 
+    def abort_user_turn(self) -> str:
+        """Invalidate an uncommitted user turn without pretending it committed."""
+        if self.turn_state not in {TurnState.USER_SPEAKING, TurnState.AWAITING_COMMIT}:
+            raise RuntimeError("can only abort an active uncommitted user turn")
+        if self.current_turn is None:
+            raise RuntimeError("an active user turn requires a current turn")
+        aborted_turn = self.current_turn
+        self.current_turn = None
+        self.user_state = UserState.IDLE
+        self.assistant_state = AssistantState.IDLE
+        self.active_generation = None
+        self.active_speech = None
+        self.partial_transcript = ""
+        self.turn_state = TurnState.LISTENING
+        return aborted_turn
+
     def begin_assistant_speech(self) -> None:
         if self.assistant_state is not AssistantState.THINKING:
             raise RuntimeError("assistant may speak only after thinking")
