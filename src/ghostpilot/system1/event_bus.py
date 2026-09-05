@@ -11,8 +11,8 @@ class EventBus:
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue[DomainEvent]] = set()
 
-    def subscribe(self) -> asyncio.Queue[DomainEvent]:
-        queue: asyncio.Queue[DomainEvent] = asyncio.Queue()
+    def subscribe(self, *, maxsize: int = 0) -> asyncio.Queue[DomainEvent]:
+        queue: asyncio.Queue[DomainEvent] = asyncio.Queue(maxsize)
         self._subscribers.add(queue)
         return queue
 
@@ -21,4 +21,6 @@ class EventBus:
 
     async def publish(self, event: DomainEvent) -> None:
         for queue in self._subscribers.copy():
-            await queue.put(event)
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(event)

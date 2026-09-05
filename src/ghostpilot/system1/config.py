@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import os
 from typing import TypeVar
 
 
@@ -49,6 +50,25 @@ class EndpointConfig:
     def __post_init__(self) -> None:
         if not 100 <= self.endpoint_timeout_ms <= 5_000:
             raise ValueError("endpoint_timeout_ms must be between 100 and 5000")
+        if not self.require_final_transcript:
+            raise ValueError("M3A endpointing requires a final transcript for the latest segment")
+
+
+@dataclass(frozen=True, slots=True)
+class NemotronSTTConfig:
+    ws_url: str = "ws://localhost:6010/v1/stt/stream"
+    health_url: str = "http://localhost:6010/health"
+    send_queue_size: int = 100
+    connect_timeout_seconds: float = 3.0
+    ready_timeout_seconds: float = 5.0
+    reconnect_initial_seconds: float = 0.25
+    reconnect_max_seconds: float = 3.0
+
+    def __post_init__(self) -> None:
+        if self.send_queue_size < 1:
+            raise ValueError("STT send_queue_size must be positive")
+        if self.connect_timeout_seconds <= 0 or self.ready_timeout_seconds <= 0:
+            raise ValueError("STT connection timeouts must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +79,23 @@ class System1Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
     endpoint: EndpointConfig = field(default_factory=EndpointConfig)
+    nemotron_stt: NemotronSTTConfig = field(default_factory=NemotronSTTConfig)
+
+    @classmethod
+    def from_env(cls, **overrides: object) -> "System1Config":
+        """Load only deployment-facing provider settings from the environment."""
+        provider = os.getenv("GHOSTPILOT_STT_PROVIDER", "mock")
+        defaults = NemotronSTTConfig()
+        nemotron = NemotronSTTConfig(
+            ws_url=os.getenv("GHOSTPILOT_STT_WS_URL", defaults.ws_url),
+            health_url=os.getenv("GHOSTPILOT_STT_HEALTH_URL", defaults.health_url),
+        )
+        values: dict[str, object] = {
+            "stt_provider": provider,
+            "nemotron_stt": nemotron,
+        }
+        values.update(overrides)
+        return cls(**values)  # type: ignore[arg-type]
 
 
 T = TypeVar("T")

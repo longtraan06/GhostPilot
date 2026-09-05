@@ -1,8 +1,8 @@
 # GhostPilot
 
-GhostPilot is a latency-first ambient personal agent. This repository currently
-contains Milestone 1: the vendor-neutral, asyncio-based System 1 interaction
-foundation.
+GhostPilot is a latency-first ambient personal agent. This repository contains
+the vendor-neutral, asyncio-based System 1 interaction runtime through M3B,
+including real microphone/VAD and self-hosted streaming STT support.
 
 ## Quick start
 
@@ -18,7 +18,7 @@ for this repository.
 
 ```text
 src/ghostpilot/system1/
-  adapters/           future vendor-SDK isolation boundary
+  adapters/           sounddevice and Nemotron protocol isolation boundary
   audio.py            canonical frames and bounded per-turn buffer
   config.py           provider selection registry
   event_bus.py        in-process async event transport

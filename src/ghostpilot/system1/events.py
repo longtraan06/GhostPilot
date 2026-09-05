@@ -38,6 +38,7 @@ class AudioFrameDropped:
 class TranscriptPartial:
     turn_id: str
     text: str
+    segment_id: int | None = None
     name: Literal["transcript.partial"] = "transcript.partial"
 
 
@@ -45,6 +46,7 @@ class TranscriptPartial:
 class TranscriptFinal:
     turn_id: str
     text: str
+    segment_id: int | None = None
     name: Literal["transcript.final"] = "transcript.final"
 
 
@@ -112,6 +114,15 @@ class ProviderFailed:
     name: Literal["system.provider_failed"] = "system.provider_failed"
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderStatusChanged:
+    provider: str
+    status: str
+    detail: str = ""
+    connection_generation: int = 0
+    name: Literal["system.provider_status"] = "system.provider_status"
+
+
 DomainEvent: TypeAlias = (
     AudioSpeechStarted
     | AudioSpeechStopped
@@ -130,4 +141,5 @@ DomainEvent: TypeAlias = (
     | SpeechFinished
     | DialogueActionProposed
     | ProviderFailed
+    | ProviderStatusChanged
 )

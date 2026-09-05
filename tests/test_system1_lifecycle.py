@@ -4,6 +4,7 @@ import unittest
 from ghostpilot.system1.mock_providers import MockDialogueProvider, MockPlayback, MockTTSProvider
 from ghostpilot.system1.providers import DialogueOutput
 from ghostpilot.system1.runtime import System1Runtime, default_provider_registry
+from ghostpilot.system1.adapters.nemotron_stt import NemotronSTTProvider
 from ghostpilot.system1.config import System1Config
 from ghostpilot.system1.state import AssistantState, TurnState, UserState
 
@@ -14,6 +15,11 @@ class System1LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await runtime.start()
         self.assertTrue(runtime.stt.connected)
         await runtime.close()
+
+    async def test_registry_can_select_nemotron_without_hard_wiring_runtime(self) -> None:
+        config = System1Config(stt_provider="nemotron")
+        provider = default_provider_registry(config).build(config.stt_provider)
+        self.assertIsInstance(provider, NemotronSTTProvider)
 
     async def test_normal_turn_streams_to_speech_and_returns_to_listening(self) -> None:
         runtime = System1Runtime(

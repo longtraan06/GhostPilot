@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 [project.optional-dependencies]
 audio = ["numpy>=1.26,<3.0", "sounddevice>=0.4.6,<1.0"]
 vad-debug = ["fastapi>=0.110,<1.0", "uvicorn[standard]>=0.27,<1.0"]
+stt = ["websockets>=14,<18"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

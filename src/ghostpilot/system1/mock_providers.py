@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterable
 
-from .providers import AudioChunk, DialogueOutput, STTEvent
+from .providers import AudioChunk, DialogueOutput, STTEvent, STTProviderEvent
 
 
 class MockSTTProvider:
@@ -13,6 +13,11 @@ class MockSTTProvider:
         self._events: asyncio.Queue[STTEvent | None] = asyncio.Queue()
         self.connected = False
         self.audio_frames: list[bytes] = []
+        self.segment_starts: list[tuple[str, int]] = []
+        self.segment_end_calls = 0
+        self.commit_calls = 0
+        self.reset_calls = 0
+        self.ping_calls = 0
 
     async def connect(self) -> None:
         self.connected = True
@@ -22,12 +27,56 @@ class MockSTTProvider:
             raise RuntimeError("STT provider is not connected")
         self.audio_frames.append(audio)
 
-    async def emit(self, text: str, *, is_final: bool, turn_id: str | None = None) -> None:
-        await self._events.put(STTEvent(text, is_final, turn_id))
+    async def start_segment(self, turn_id: str, segment_id: int) -> None:
+        self.segment_starts.append((turn_id, segment_id))
 
-    async def events(self) -> AsyncIterator[STTEvent]:
+    async def end_segment(self) -> None:
+        self.segment_end_calls += 1
+
+    async def commit_turn(self) -> None:
+        self.commit_calls += 1
+
+    async def reset(self) -> None:
+        self.reset_calls += 1
+
+    async def ping(self) -> None:
+        self.ping_calls += 1
+
+    async def reconnect(self) -> None:
+        self.connected = True
+
+    async def emit(
+        self,
+        text: str,
+        *,
+        is_final: bool,
+        turn_id: str | None = None,
+        segment_id: int | None = None,
+    ) -> None:
+        """Inject a snapshot result, optionally tied to a speech segment."""
+        await self._events.put(STTEvent(text, is_final, turn_id, segment_id))
+
+    async def events(self) -> AsyncIterator[STTProviderEvent]:
         while (event := await self._events.get()) is not None:
             yield event
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "provider": "mock",
+            "connected": self.connected,
+            "health_status": "mock",
+            "model": "deterministic mock",
+            "device": "local",
+            "lookahead": None,
+            "streaming_latency_ms": None,
+            "warmed_up": True,
+            "reconnect_count": 0,
+            "last_error": "",
+            "frames_sent": len(self.audio_frames),
+            "audio_bytes_sent": sum(len(frame) for frame in self.audio_frames),
+            "send_queue_depth": 0,
+            "stt_dropped_frames": 0,
+        }
 
     async def close(self) -> None:
         self.connected = False

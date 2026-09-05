@@ -214,8 +214,8 @@ running `AudioInput` adapter while keeping the System 1 runtime alive.
 Audio frames fan out in parallel to VAD and `STTProvider`. Mock STT emits
 snapshot-style `STTEvent` values: partial text produces `transcript.partial`,
 and stable text produces `transcript.final`. `TranscriptManager` is scoped to a
-turn, replaces overlapping snapshot updates rather than concatenating them, and
-prefers final text as the commit candidate.
+turn and replaces overlapping snapshot updates rather than concatenating them.
+Only a final from the latest speech segment is an endpoint commit candidate.
 
 VAD stop is still only acoustic information. It enters `AWAITING_COMMIT` and
 starts a cancellation-aware endpoint timer (600 ms by default). The M3A
@@ -225,6 +225,23 @@ cancels the timer and preserves the same turn ID, turn audio, and transcript.
 Delayed STT events carry optional turn IDs and are ignored unless they match
 the active transcript turn.
 
+### M3A.1: turns and speech segments
+
+A conversation turn is not the same thing as a VAD speech segment. A person
+may pause briefly and continue the same turn, so resuming from
+`AWAITING_COMMIT` retains its turn ID, audio buffer, and earlier transcript
+snapshots while starting the next monotonic speech segment. Starting that
+segment resets `latest_segment_final`; an older final is still useful history,
+but cannot authorize endpoint commit.
+
+Endpointing therefore requires a valid final for the latest segment, rather
+than merely any final in the turn. A provider-neutral optional `segment_id` on
+an STT event lets an adapter associate delayed network results with the speech
+segment that produced them. Runtime rejects a result whose turn or segment is
+no longer active. This preserves the mock contract today and gives future
+provider adapters a safe normalization point without embedding vendor logic in
+the runtime.
+
 For manual mock testing, start the existing VAD debug UI, select an input, and
 speak until a user turn starts. Enter text in **Inject mock transcript**, send
 one or more partials and then a final. Stop speaking: the dashboard shows
@@ -232,6 +249,75 @@ one or more partials and then a final. Stop speaking: the dashboard shows
 The equivalent development endpoint is `POST /api/mock-transcript` with JSON
 `{"text":"hello ghostpilot","is_final":true}`; it is only available when
 the active provider is `MockSTTProvider`.
+
+## Milestone 3B: self-hosted Nemotron streaming STT
+
+`NemotronSTTProvider` is the vendor/protocol adapter for the self-hosted
+Nemotron service. It owns health validation, one persistent WebSocket,
+binary/control framing, a bounded audio send queue, response parsing, service
+diagnostics, and reconnect backoff. System 1, VAD, transcript management,
+endpointing, and turn ownership do not import WebSocket details.
+
+At startup the adapter validates `/health`: `ok` and `warmed_up` must be true,
+the sample rate must be 16 kHz, and lookahead must be 1. It then connects to the
+stream endpoint, waits briefly for `ready`, and keeps reconnecting in the
+background if the service is unavailable. Each successful connection has a
+monotonic generation; receive work from older connections is rejected and the
+new server-side decoder is reset. Provider errors become typed System 1 status
+and failure events rather than crashing the runtime.
+
+Microphone frames remain canonical PCM16 little-endian, mono, 16 kHz. VAD and
+STT consume the same asyncio audio path, outside the PortAudio callback. STT is
+speech-gated: when VAD starts a segment, the bounded pre-roll is queued first,
+then live frames are queued while speech remains active. Silence outside a
+speech segment is not sent. Queue overflow drops frames deterministically and
+is visible in diagnostics instead of blocking capture or growing memory.
+
+VAD `SPEECH_STOPPED` sends the provider-neutral `end_segment()` control, which
+the adapter maps to `{"type":"segment_end"}`. Nemotron partial/final messages
+become snapshot-style `STTEvent` values tagged with the active turn and server
+segment ID. A segment final is not a user-turn commit. Only EndpointDetector may
+commit after its timeout and latest-segment-final checks. Local turn state is
+committed once, then `commit_turn()` sends the server control; `turn_final` is
+treated only as an acknowledgement and can never trigger a second commit.
+
+Configure and run real STT mode in PowerShell:
+
+```powershell
+$env:GHOSTPILOT_STT_PROVIDER = "nemotron"
+$env:GHOSTPILOT_STT_WS_URL = "ws://localhost:6010/v1/stt/stream"
+$env:GHOSTPILOT_STT_HEALTH_URL = "http://localhost:6010/health"
+python -m ghostpilot.system1.vad_debug --port 8765
+```
+
+Open `http://127.0.0.1:8765`, select an input device, and use the M3B dashboard
+to inspect System 1/VAD state, service health and reconnects, partial/final/best
+transcripts, turn and segment finality, endpoint timer, audio queue/backpressure,
+latencies, and the bounded event timeline. Reconnect, reset, and ping controls
+operate only on the STT adapter and do not bypass System 1 turn ownership.
+
+The **Microphone + Listen Back** panel is an explicit local diagnostic. After
+an input is selected, **Record 4 seconds** taps the canonical frames in the
+asyncio runtime path, keeps at most the requested bounded duration, and returns
+a PCM16 mono WAV for playback in the browser. It does not use browser microphone
+capture, does not place PCM on the EventBus, and does not add work to the
+PortAudio callback. This separates wrong/quiet input-device problems from STT
+service or protocol problems.
+
+For protocol diagnosis, run the dashboard with `--debug-stt`. Console logging
+records the first PCM send and one-second aggregate progress, each control after
+it is actually written to the WebSocket, every response type/payload, and any
+turn/segment/generation rejection. It still does not log every 20 ms frame.
+The web **STT Protocol Debug** and **STT Protocol Trace** panels expose the same
+essential counters: frames queued/sent for the active segment, last control,
+last response type, partial/final totals, ignored responses, and the exact last
+rejection reason. `PCM SENT · NO TRANSCRIPT RESPONSE` means capture and client
+WebSocket sending succeeded but no partial/final was received for that segment.
+
+The adapter currently assumes the service's transcript text follows the
+existing full-turn snapshot contract. A service that returns segment-local text
+must normalize/merge it in its adapter rather than adding provider-specific
+merging to `TranscriptManager`.
 
 ## Required Tests
 

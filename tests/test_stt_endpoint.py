@@ -51,6 +51,7 @@ class MockSTTEndpointTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.005)
 
         self.assertEqual(stt.audio_frames, [frame(1).data])
+        self.assertEqual(stt.segment_starts, [("turn-1", 1)])
         self.assertEqual(runtime.state.turn_state, TurnState.USER_SPEAKING)
         await runtime.close()
 
@@ -107,6 +108,8 @@ class MockSTTEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("conversation.turn_committed", seen)
         self.assertEqual(runtime.state.committed_transcript, "open settings")
         self.assertEqual(runtime.endpoint_state, EndpointState.COMMITTED)
+        self.assertEqual(stt.segment_end_calls, 1)
+        self.assertEqual(stt.commit_calls, 1)
         await runtime.wait_for_response()
         await runtime.close()
 
@@ -130,6 +133,7 @@ class MockSTTEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.transcripts.snapshot().partial, "I think this")
         self.assertEqual(runtime.state.turn_state, TurnState.USER_SPEAKING)
         self.assertEqual(dialogue.stream_calls, 0)
+        self.assertEqual(stt.commit_calls, 0)
         await runtime.close()
 
     async def test_resume_then_final_transcript_commits_exactly_once(self) -> None:
@@ -150,6 +154,100 @@ class MockSTTEndpointTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(lambda: dialogue.stream_calls == 1)
         self.assertEqual(runtime.state.committed_transcript, "I think this is correct")
         await runtime.wait_for_response()
+        await runtime.close()
+
+    async def test_old_segment_final_cannot_commit_a_resumed_segment(self) -> None:
+        """An old final remains history, but cannot end the current segment."""
+        stt = MockSTTProvider()
+        dialogue = MockDialogueProvider()
+        runtime = System1Runtime(stt=stt, dialogue=dialogue, config=endpoint_config())
+        events = runtime.events.subscribe()
+        await runtime.start()
+        turn_id = await runtime.on_user_speech_started()
+        first_segment = runtime.transcripts.segment_id
+        await stt.emit("I think this", is_final=True, turn_id=turn_id, segment_id=first_segment)
+        await wait_until(lambda: runtime.transcripts.snapshot().latest_segment_final)
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.03)
+
+        self.assertEqual(await runtime.on_user_speech_started(), turn_id)
+        second_segment = runtime.transcripts.segment_id
+        self.assertGreater(second_segment, first_segment)
+        self.assertFalse(runtime.transcripts.snapshot().latest_segment_final)
+        await stt.emit(
+            "I think this is actually",
+            is_final=False,
+            turn_id=turn_id,
+            segment_id=second_segment,
+        )
+        await wait_until(lambda: runtime.transcripts.snapshot().latest_segment_text.endswith("actually"))
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.14)
+
+        self.assertEqual(runtime.transcripts.snapshot().final, "I think this")
+        self.assertFalse(runtime.transcripts.snapshot().latest_segment_final)
+        self.assertEqual(runtime.state.turn_state, TurnState.AWAITING_COMMIT)
+        self.assertEqual(dialogue.stream_calls, 0)
+        seen = []
+        while not events.empty():
+            seen.append((await events.get()).name)
+        self.assertNotIn("conversation.turn_committed", seen)
+        await runtime.close()
+
+    async def test_newest_segment_final_commits_once_after_old_final_was_rejected(self) -> None:
+        stt = MockSTTProvider()
+        dialogue = MockDialogueProvider([DialogueOutput("Okay.")], delay=0.2)
+        runtime = System1Runtime(stt=stt, dialogue=dialogue, config=endpoint_config())
+        await runtime.start()
+        turn_id = await runtime.on_user_speech_started()
+        first_segment = runtime.transcripts.segment_id
+        await stt.emit("I think this", is_final=True, turn_id=turn_id, segment_id=first_segment)
+        await wait_until(lambda: runtime.transcripts.snapshot().latest_segment_final)
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.03)
+
+        await runtime.on_user_speech_started()
+        second_segment = runtime.transcripts.segment_id
+        await stt.emit(
+            "I think this is actually",
+            is_final=False,
+            turn_id=turn_id,
+            segment_id=second_segment,
+        )
+        await wait_until(lambda: runtime.transcripts.snapshot().latest_segment_text.endswith("actually"))
+        await runtime.on_user_speech_stopped()
+        await asyncio.sleep(0.14)
+        self.assertEqual(dialogue.stream_calls, 0)
+
+        await stt.emit(
+            "I think this is actually correct",
+            is_final=True,
+            turn_id=turn_id,
+            segment_id=second_segment,
+        )
+        await wait_until(lambda: dialogue.stream_calls == 1)
+        self.assertEqual(runtime.state.committed_transcript, "I think this is actually correct")
+        self.assertEqual(dialogue.stream_calls, 1)
+        await runtime.wait_for_response()
+        await runtime.close()
+
+    async def test_delayed_old_segment_final_cannot_mark_latest_segment_final(self) -> None:
+        stt = MockSTTProvider()
+        runtime = System1Runtime(stt=stt, config=endpoint_config())
+        await runtime.start()
+        turn_id = await runtime.on_user_speech_started()
+        first_segment = runtime.transcripts.segment_id
+        await runtime.on_user_speech_stopped()
+        self.assertEqual(await runtime.on_user_speech_started(), turn_id)
+        second_segment = runtime.transcripts.segment_id
+
+        await stt.emit("delayed first segment", is_final=True, turn_id=turn_id, segment_id=first_segment)
+        await asyncio.sleep(0.03)
+
+        snapshot = runtime.transcripts.snapshot()
+        self.assertEqual(snapshot.segment_id, second_segment)
+        self.assertFalse(snapshot.latest_segment_final)
+        self.assertEqual(snapshot.final, "")
         await runtime.close()
 
     async def test_partial_only_does_not_auto_commit(self) -> None:

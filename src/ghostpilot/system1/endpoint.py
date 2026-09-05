@@ -26,4 +26,6 @@ class FinalTranscriptEndpointDetector:
         self.config = config
 
     def should_commit(self, transcript: TranscriptSnapshot) -> bool:
-        return bool(transcript.final) if self.config.require_final_transcript else bool(transcript.best)
+        # A final from a previous VAD speech segment belongs to the same user
+        # turn, but must never authorize committing a later resumed segment.
+        return transcript.latest_segment_final and bool(transcript.commit_text)

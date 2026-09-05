@@ -4,7 +4,12 @@ import unittest
 
 from ghostpilot.system1.audio import AudioFrame
 from ghostpilot.system1.config import AudioConfig, System1Config, VADConfig
-from ghostpilot.system1.mock_providers import MockDialogueProvider, MockPlayback, MockTTSProvider
+from ghostpilot.system1.mock_providers import (
+    MockDialogueProvider,
+    MockPlayback,
+    MockSTTProvider,
+    MockTTSProvider,
+)
 from ghostpilot.system1.providers import DialogueOutput
 from ghostpilot.system1.runtime import System1Runtime
 from ghostpilot.system1.state import TurnState
@@ -31,6 +36,42 @@ async def wait_until(predicate, timeout: float = 0.5) -> None:
 
 
 class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stt_is_speech_gated_and_receives_only_bounded_pre_roll(self) -> None:
+        audio = FakeAudioInput()
+        stt = MockSTTProvider()
+        vad = FakeVAD(
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                VADEvent(VADEventKind.SPEECH_STARTED),
+                None,
+                VADEvent(VADEventKind.SPEECH_STOPPED),
+            ]
+        )
+        runtime = System1Runtime(
+            audio_input=audio,
+            vad=vad,
+            stt=stt,
+            config=System1Config(audio=AudioConfig(pre_roll_ms=60)),
+        )
+        await runtime.start()
+        for sequence in range(1, 9):
+            audio.push(frame(sequence, sequence))
+
+        await wait_until(
+            lambda: audio.queue_size == 0
+            and runtime.state.turn_state is TurnState.AWAITING_COMMIT
+        )
+        sent_amplitudes = [
+            int.from_bytes(item[:2], "little", signed=True) for item in stt.audio_frames
+        ]
+        self.assertEqual(sent_amplitudes, [4, 5, 6, 7, 8])
+        self.assertEqual(stt.segment_end_calls, 1)
+        await runtime.close()
+
     async def test_pre_roll_is_prepended_to_new_turn_in_sequence_order(self) -> None:
         audio = FakeAudioInput()
         vad = FakeVAD([None, None, None, VADEvent(VADEventKind.SPEECH_STARTED, 0.9)])
