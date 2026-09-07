@@ -20,6 +20,8 @@ HEALTH = {
     "model": "nvidia/nemotron-speech-streaming-en-0.6b",
     "device": "cuda:0",
     "lookahead": 1,
+    "protocol_version": 2,
+    "capabilities": ["explicit_segment_id"],
     "sample_rate": 16_000,
     "streaming_latency_ms": 160,
     "warmed_up": True,
@@ -125,6 +127,19 @@ class NemotronSTTProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(socket.sent[0]), {"type": "reset"})
         await provider.close()
 
+    async def test_rejects_legacy_service_without_explicit_segment_binding(self) -> None:
+        async def legacy_health(_url: str) -> dict[str, object]:
+            health = dict(HEALTH)
+            health.pop("protocol_version")
+            health.pop("capabilities")
+            return health
+
+        provider = NemotronSTTProvider(
+            test_config(), connect_factory=lambda _: FakeWebSocket(), health_fetcher=legacy_health
+        )
+        with self.assertRaisesRegex(RuntimeError, "explicit_segment_id"):
+            await provider._validate_health()
+
     async def test_sends_pcm_and_all_control_messages(self) -> None:
         socket = FakeWebSocket()
         socket.push({"type": "ready"})
@@ -156,11 +171,21 @@ class NemotronSTTProviderTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await provider.reset()
-        await wait_until(lambda: len(socket.sent) >= 6)
+        await wait_until(lambda: len(socket.sent) >= 7)
 
         self.assertIn(pcm, socket.sent)
-        controls = [json.loads(item)["type"] for item in socket.sent if isinstance(item, str)]
-        self.assertEqual(controls, ["reset", "segment_end", "ping", "commit", "reset"])
+        controls = [json.loads(item) for item in socket.sent if isinstance(item, str)]
+        self.assertEqual(
+            controls,
+            [
+                {"type": "reset"},
+                {"type": "segment_start", "segment_id": 1},
+                {"type": "segment_end"},
+                {"type": "ping"},
+                {"type": "commit"},
+                {"type": "reset"},
+            ],
+        )
         self.assertEqual(provider.diagnostics()["frames_sent"], 1)
         self.assertEqual(provider.diagnostics()["audio_bytes_sent"], len(pcm))
         self.assertEqual(provider.diagnostics()["segment_frames_sent"], 1)
@@ -178,15 +203,23 @@ class NemotronSTTProviderTests(unittest.IsolatedAsyncioTestCase):
         await provider.start_segment("turn-1", 2)
         await provider.send_audio(b"segment-two")
         await provider.end_segment()
-        await wait_until(lambda: len(socket.sent) >= 5)
+        await wait_until(lambda: len(socket.sent) >= 7)
 
         ordered = [
-            item if isinstance(item, bytes) else json.loads(item)["type"]
+            item if isinstance(item, bytes) else json.loads(item)
             for item in socket.sent
         ]
         self.assertEqual(
             ordered,
-            ["reset", b"segment-one", "segment_end", b"segment-two", "segment_end"],
+            [
+                {"type": "reset"},
+                {"type": "segment_start", "segment_id": 1},
+                b"segment-one",
+                {"type": "segment_end"},
+                {"type": "segment_start", "segment_id": 2},
+                b"segment-two",
+                {"type": "segment_end"},
+            ],
         )
         await provider.close()
 
@@ -266,7 +299,7 @@ class NemotronSTTProviderTests(unittest.IsolatedAsyncioTestCase):
         await provider.start_segment("turn-1", 1)
         await provider.send_audio(b"audio-1")
         await provider.send_audio(b"audio-2")
-        for _ in range(8):
+        for _ in range(7):
             await provider.ping()
 
         await provider.end_segment()
@@ -277,7 +310,8 @@ class NemotronSTTProviderTests(unittest.IsolatedAsyncioTestCase):
             for message in provider._send_queue
             if message.kind == "control"
         ]
-        self.assertEqual(queued_controls.count("ping"), 8)
+        self.assertEqual(queued_controls.count("ping"), 7)
+        self.assertIn("segment_start", queued_controls)
         self.assertIn("segment_end", queued_controls)
         self.assertIn("commit", queued_controls)
         self.assertFalse(any(message.kind == "audio" for message in provider._send_queue))

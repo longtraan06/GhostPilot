@@ -260,12 +260,13 @@ diagnostics, and reconnect backoff. System 1, VAD, transcript management,
 endpointing, and turn ownership do not import WebSocket details.
 
 At startup the adapter validates `/health`: `ok` and `warmed_up` must be true,
-the sample rate must be 16 kHz, and lookahead must be 1. It then connects to the
-stream endpoint, waits briefly for `ready`, and keeps reconnecting in the
-background if the service is unavailable. Each successful connection has a
-monotonic generation; receive work from older connections is rejected and the
-new server-side decoder is reset. Provider errors become typed System 1 status
-and failure events rather than crashing the runtime.
+the sample rate must be 16 kHz, lookahead must be 1, and protocol version 2
+must advertise `explicit_segment_id`. It then connects to the stream endpoint,
+waits briefly for `ready`, and keeps reconnecting in the background if the
+service is unavailable. Each successful connection has a monotonic generation;
+receive work from older connections is rejected and the new server-side decoder
+is reset. Provider errors become typed System 1 status and failure events rather
+than crashing the runtime.
 
 Microphone frames remain canonical PCM16 little-endian, mono, 16 kHz. VAD and
 STT consume the same asyncio audio path, outside the PortAudio callback. STT is
@@ -274,13 +275,15 @@ then live frames are queued while speech remains active. Silence outside a
 speech segment is not sent. Queue overflow drops frames deterministically and
 is visible in diagnostics instead of blocking capture or growing memory.
 
-VAD `SPEECH_STOPPED` sends the provider-neutral `end_segment()` control, which
-the adapter maps to `{"type":"segment_end"}`. Nemotron partial/final messages
-become snapshot-style `STTEvent` values tagged with the active turn and server
-segment ID. A segment final is not a user-turn commit. Only EndpointDetector may
-commit after its timeout and latest-segment-final checks. Local turn state is
-committed once, then `commit_turn()` sends the server control; `turn_final` is
-treated only as an acknowledgement and can never trigger a second commit.
+At VAD speech start, the adapter first sends
+`{"type":"segment_start","segment_id":LOCAL_ID}` before pre-roll or PCM.
+The service must echo this exact ID in partial/final messages; its private
+decoder generation is never exposed. VAD `SPEECH_STOPPED` then sends the
+provider-neutral `end_segment()` control, mapped to `{"type":"segment_end"}`.
+A segment final is not a user-turn commit. Only EndpointDetector may commit
+after its timeout and latest-segment-final checks. Local turn state is committed
+once, then `commit_turn()` sends the server control; `turn_final` is treated
+only as an acknowledgement and can never trigger a second commit.
 
 Configure and run real STT mode in PowerShell:
 

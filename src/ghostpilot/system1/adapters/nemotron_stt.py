@@ -154,6 +154,10 @@ class NemotronSTTProvider:
         self._segment_bytes_sent = 0
         self._segment_partial_responses = 0
         self._segment_final_responses = 0
+        # The service owns decoder internals, but GhostPilot owns VAD segment
+        # identity. Bind it before any PCM reaches the server so its partial
+        # and final events are safely comparable to local transcript state.
+        await self._enqueue_control("segment_start", segment_id=segment_id)
         self._trace_event(f"segment started: {turn_id} / {segment_id}")
         logger.info("STT segment started", extra={"turn_id": turn_id, "segment_id": segment_id})
 
@@ -501,6 +505,11 @@ class NemotronSTTProvider:
             mismatches.append("sample_rate must be 16000")
         if health.get("lookahead") != 1:
             mismatches.append("lookahead must be 1")
+        if health.get("protocol_version") != 2:
+            mismatches.append("protocol_version must be 2")
+        capabilities = health.get("capabilities")
+        if not isinstance(capabilities, list) or "explicit_segment_id" not in capabilities:
+            mismatches.append("explicit_segment_id capability is required")
         if health.get("warmed_up") is not True:
             mismatches.append("warmed_up must be true")
         if mismatches:
@@ -508,8 +517,10 @@ class NemotronSTTProvider:
             raise RuntimeError("invalid STT health: " + ", ".join(mismatches))
         self._health_status = "healthy"
 
-    async def _enqueue_control(self, message_type: str) -> None:
-        message = json.dumps({"type": message_type}, separators=(",", ":"))
+    async def _enqueue_control(self, message_type: str, **fields: object) -> None:
+        message = json.dumps(
+            {"type": message_type, **fields}, separators=(",", ":")
+        )
         async with self._send_condition:
             while len(self._send_queue) >= self._send_queue_capacity:
                 audio_index = next(

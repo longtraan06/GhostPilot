@@ -14,7 +14,7 @@ System 1 contract:
 
 Run:
     pip install fastapi "uvicorn[standard]" numpy torch transformers
-    python nemotron_stt_service.py
+    python nemotron_stt_service_warmup.py
 
 WebSocket:
     ws://HOST:8001/v1/stt/stream
@@ -23,6 +23,10 @@ Binary messages:
     Raw PCM16 mono 16 kHz bytes.
 
 JSON control messages:
+    {"type": "segment_start", "segment_id": 4}
+        Bind the next decoder segment to GhostPilot's authoritative VAD
+        segment ID. This control must arrive before PCM for that segment.
+
     {"type": "segment_end"}
         Finalize the current VAD speech segment.
         The service emits a "final" transcript snapshot, but does NOT decide
@@ -66,6 +70,8 @@ from transformers import AutoModelForRNNT, AutoProcessor, TextIteratorStreamer
 MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
 DEVICE = "cuda:0"
 LOOKAHEAD = 1
+PROTOCOL_VERSION = 2
+CAPABILITIES = ("explicit_segment_id",)
 HOST = "0.0.0.0"
 PORT = 8001
 
@@ -277,17 +283,17 @@ class DecoderWorker:
         runtime: ModelRuntime,
         loop: asyncio.AbstractEventLoop,
         on_event: Callable[[dict[str, Any]], None],
-        segment_id: int,
+        decoder_generation: int,
     ) -> None:
         self.runtime = runtime
         self.loop = loop
         self.on_event = on_event
-        self.segment_id = segment_id
+        self.decoder_generation = decoder_generation
 
         self._features: queue.Queue[tuple[np.ndarray, bool] | None] = queue.Queue(maxsize=64)
         self._thread = threading.Thread(
             target=self._run,
-            name=f"nemotron-segment-{segment_id}",
+            name=f"nemotron-segment-{decoder_generation}",
             daemon=True,
         )
         self._started = False
@@ -313,7 +319,7 @@ class DecoderWorker:
         try:
             first_item = self._features.get()
             if first_item is None:
-                self._emit({"kind": "done", "segment_id": self.segment_id})
+                self._emit({"kind": "done", "decoder_generation": self.decoder_generation})
                 return
 
             first_audio, is_first = first_item
@@ -380,7 +386,7 @@ class DecoderWorker:
 
             generate_thread = threading.Thread(
                 target=generate,
-                name=f"nemotron-generate-{self.segment_id}",
+                name=f"nemotron-generate-{self.decoder_generation}",
                 daemon=True,
             )
             generate_thread.start()
@@ -390,7 +396,7 @@ class DecoderWorker:
                     self._emit(
                         {
                             "kind": "piece",
-                            "segment_id": self.segment_id,
+                            "decoder_generation": self.decoder_generation,
                             "text": piece,
                         }
                     )
@@ -400,13 +406,13 @@ class DecoderWorker:
             if generation_error:
                 raise RuntimeError(generation_error[0])
 
-            self._emit({"kind": "done", "segment_id": self.segment_id})
+            self._emit({"kind": "done", "decoder_generation": self.decoder_generation})
 
         except Exception:
             self._emit(
                 {
                     "kind": "error",
-                    "segment_id": self.segment_id,
+                    "decoder_generation": self.decoder_generation,
                     "error": traceback.format_exc(),
                 }
             )
@@ -431,7 +437,13 @@ class STTSession:
 
         self.turn_text = ""
         self.segment_text = ""
-        self.segment_id = 0
+        # Public IDs belong to GhostPilot's VAD state machine. Decoder
+        # generations are private so reset/late workers can never make a
+        # server-side counter drift from that external contract.
+        self._pending_client_segment_id: int | None = None
+        self._active_client_segment_id: int | None = None
+        self._last_client_segment_id = 0
+        self._decoder_generation = 0
         self.decoder: DecoderWorker | None = None
         self.segment_done = asyncio.Event()
         self.closed = False
@@ -443,6 +455,8 @@ class STTSession:
                 "model": MODEL_ID,
                 "device": DEVICE,
                 "lookahead": LOOKAHEAD,
+                "protocol_version": PROTOCOL_VERSION,
+                "capabilities": list(CAPABILITIES),
                 "sample_rate": SAMPLE_RATE,
                 "channels": CHANNELS,
                 "sample_format": "pcm_s16le",
@@ -451,16 +465,36 @@ class STTSession:
             }
         )
 
+    def start_segment(self, client_segment_id: int) -> None:
+        """Bind the next decoder to one explicit GhostPilot speech segment."""
+        if isinstance(client_segment_id, bool) or client_segment_id < 1:
+            raise ValueError("segment_start requires a positive integer segment_id")
+        if self.decoder is not None or self.builder.has_audio:
+            raise ValueError("cannot start a segment while the previous segment is active")
+        if self._pending_client_segment_id is not None:
+            raise ValueError("a segment_start is already pending")
+        if client_segment_id <= self._last_client_segment_id:
+            raise ValueError(
+                "segment_id must be monotonic within a GhostPilot turn "
+                f"(last={self._last_client_segment_id}, got={client_segment_id})"
+            )
+        self._pending_client_segment_id = client_segment_id
+
     def _ensure_decoder(self) -> DecoderWorker:
         if self.decoder is None:
-            self.segment_id += 1
+            client_segment_id = self._pending_client_segment_id
+            if client_segment_id is None:
+                raise ValueError("PCM requires segment_start before audio")
+            self._pending_client_segment_id = None
+            self._active_client_segment_id = client_segment_id
             self.segment_text = ""
             self.segment_done = asyncio.Event()
+            self._decoder_generation += 1
             self.decoder = DecoderWorker(
                 self.runtime,
                 self.loop,
                 self._on_decoder_event,
-                self.segment_id,
+                self._decoder_generation,
             )
         return self.decoder
 
@@ -468,9 +502,13 @@ class STTSession:
         if self.closed:
             return
 
-        if event.get("segment_id") != self.segment_id:
+        if event.get("decoder_generation") != self._decoder_generation:
             # Ignore a late event from a decoder that no longer owns the active
             # segment.
+            return
+
+        client_segment_id = self._active_client_segment_id
+        if client_segment_id is None:
             return
 
         kind = event["kind"]
@@ -482,7 +520,7 @@ class STTSession:
                 {
                     "type": "partial",
                     "text": snapshot,
-                    "segment_id": self.segment_id,
+                    "segment_id": client_segment_id,
                 }
             )
             return
@@ -494,10 +532,12 @@ class STTSession:
                 {
                     "type": "final",
                     "text": snapshot,
-                    "segment_id": self.segment_id,
+                    "segment_id": client_segment_id,
                 }
             )
             self.decoder = None
+            self._last_client_segment_id = client_segment_id
+            self._active_client_segment_id = None
             self.builder.reset()
             self.segment_done.set()
             return
@@ -508,10 +548,11 @@ class STTSession:
                     "type": "error",
                     "code": "decoder_error",
                     "message": event["error"],
-                    "segment_id": self.segment_id,
+                    "segment_id": client_segment_id,
                 }
             )
             self.decoder = None
+            self._active_client_segment_id = None
             self.builder.reset()
             self.segment_done.set()
 
@@ -542,13 +583,19 @@ class STTSession:
 
     async def finalize_segment(self) -> None:
         if not self.builder.has_audio and self.decoder is None:
-            # Preserve protocol determinism: an empty segment simply returns the
-            # current turn snapshot as final.
+            # Preserve protocol determinism for an explicitly started empty
+            # segment. A later commit after an already-finalized segment should
+            # not emit a duplicate final.
+            client_segment_id = self._pending_client_segment_id
+            if client_segment_id is None:
+                return
+            self._pending_client_segment_id = None
+            self._last_client_segment_id = client_segment_id
             await self.outgoing.put(
                 {
                     "type": "final",
                     "text": self.turn_text,
-                    "segment_id": self.segment_id,
+                    "segment_id": client_segment_id,
                 }
             )
             return
@@ -573,25 +620,31 @@ class STTSession:
         )
         self.turn_text = ""
         self.segment_text = ""
+        self._pending_client_segment_id = None
+        self._active_client_segment_id = None
+        self._last_client_segment_id = 0
         self.builder.reset()
 
     async def reset(self) -> None:
+        # Invalidate events from a worker that was active before the reset.
+        self._decoder_generation += 1
         if self.decoder is not None:
-            # End the model iterator cleanly, but discard the resulting
-            # transcript by invalidating the active segment id.
             old = self.decoder
-            self.segment_id += 1
             self.decoder = None
             old.finish()
 
         self.turn_text = ""
         self.segment_text = ""
+        self._pending_client_segment_id = None
+        self._active_client_segment_id = None
+        self._last_client_segment_id = 0
         self.builder.reset()
         self.segment_done.set()
         await self.outgoing.put({"type": "reset_ok"})
 
     async def close(self) -> None:
         self.closed = True
+        self._decoder_generation += 1
         if self.decoder is not None:
             self.decoder.finish()
             self.decoder = None
@@ -767,6 +820,8 @@ async def health() -> dict[str, Any]:
         "model": MODEL_ID,
         "device": DEVICE,
         "lookahead": LOOKAHEAD,
+        "protocol_version": PROTOCOL_VERSION,
+        "capabilities": list(CAPABILITIES),
         "sample_rate": SAMPLE_RATE,
         "streaming_latency_ms": (
             int(runtime.processor.streaming_latency_ms) if runtime else None
@@ -843,7 +898,29 @@ async def stt_stream(websocket: WebSocket) -> None:
 
             kind = control.get("type")
 
-            if kind == "segment_end":
+            if kind == "segment_start":
+                segment_id = control.get("segment_id")
+                if not isinstance(segment_id, int) or isinstance(segment_id, bool):
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "bad_segment_start",
+                            "message": "segment_start requires an integer segment_id",
+                        }
+                    )
+                    continue
+                try:
+                    session.start_segment(segment_id)
+                except ValueError as exc:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "bad_segment_start",
+                            "message": str(exc),
+                            "segment_id": segment_id,
+                        }
+                    )
+            elif kind == "segment_end":
                 await session.finalize_segment()
             elif kind == "commit":
                 await session.commit_turn()
@@ -876,7 +953,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "nemotron_stt_service:app",
+        app,
         host=HOST,
         port=PORT,
         reload=False,
