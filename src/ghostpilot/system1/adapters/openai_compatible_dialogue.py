@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - exercised by composition, not the fake
     AsyncOpenAI = None  # type: ignore[assignment,misc]
 
 from ..config import OpenAICompatibleDialogueConfig
-from ..providers import DialogueOutput
+from ..providers import DialogueOutput, DialogueProviderError
 
 
 logger = logging.getLogger(__name__)
@@ -135,12 +135,13 @@ class OpenAICompatibleDialogueProvider:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            # Transport failures are contained in the provider so a background response
-            # task cannot take down the realtime loop.  Diagnostics retain the reason.
+            # Preserve diagnostics, then let TurnManager surface a provider-neutral
+            # failure event and recover the conversation state.
             if generation == self._active_generation:
                 self._requests_failed += 1
                 self._last_error = f"{type(error).__name__}: {error}"
                 logger.warning("Dialogue request failed: %s", self._last_error)
+                raise DialogueProviderError(self._last_error) from error
         finally:
             await _close_stream(request_stream)
             now = loop.time()

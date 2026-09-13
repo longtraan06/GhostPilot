@@ -6,6 +6,7 @@ from ghostpilot.system1.adapters.openai_compatible_dialogue import (
     OpenAICompatibleDialogueProvider,
 )
 from ghostpilot.system1.config import OpenAICompatibleDialogueConfig
+from ghostpilot.system1.providers import DialogueProviderError
 
 
 def chunk(content=None, *, finish_reason=None):
@@ -189,7 +190,8 @@ class OpenAICompatibleDialogueProviderTests(unittest.IsolatedAsyncioTestCase):
         good_stream = FakeStream([chunk("Recovered.")])
         provider, _ = provider_for(ConnectionError("server unavailable"), good_stream)
 
-        self.assertEqual(await collect(provider, "first"), [])
+        with self.assertRaises(DialogueProviderError):
+            await collect(provider, "first")
         self.assertEqual(provider.diagnostics()["requests_failed"], 1)
         self.assertIn("ConnectionError", provider.diagnostics()["last_error"])
         self.assertEqual(await collect(provider, "second"), ["Recovered."])
@@ -207,7 +209,8 @@ class OpenAICompatibleDialogueProviderTests(unittest.IsolatedAsyncioTestCase):
         missing_model = OpenAICompatibleDialogueProvider(
             OpenAICompatibleDialogueConfig(model=""), client=FakeClient([])
         )
-        self.assertEqual(await collect(missing_model), [])
+        with self.assertRaises(DialogueProviderError):
+            await collect(missing_model)
         self.assertIn("GHOSTPILOT_DIALOGUE_MODEL", missing_model.diagnostics()["last_error"])
 
     async def test_passes_configured_server_extension_without_coupling_turn_manager(self):

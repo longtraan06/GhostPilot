@@ -115,6 +115,8 @@ snapshot = function(s) {
   $('dialogueText').textContent = dialogue.live_text || 'Waiting for a committed turn…';
 };
 </script></body></html>""")
+PAGE = PAGE.replace("GhostPilot System 1 · M3B", "GhostPilot System 1 · Realtime Debug")
+PAGE = PAGE.replace("GhostPilot System 1 — M3B Realtime Debug", "GhostPilot System 1 — Realtime Debug")
 
 
 def create_app(runtime: System1Runtime) -> "FastAPI":

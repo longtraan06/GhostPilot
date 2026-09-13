@@ -132,6 +132,7 @@ class System1Runtime:
     async def close(self) -> None:
         await self._cancel_pending_endpoint()
         await self._stop_audio_input()
+        await self.turns.close()
         if self._stt_task:
             self._stt_task.cancel()
             with suppress(asyncio.CancelledError):

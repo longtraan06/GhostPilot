@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 from .event_bus import EventBus
 from .events import (
@@ -14,11 +15,12 @@ from .events import (
     ConversationTurnStarted,
     DialogueActionProposed,
     GenerationStarted,
+    ProviderFailed,
     SpeechFinished,
     SpeechStarted,
 )
 from .interruption import InterruptionController
-from .providers import DialogueProvider, Playback, TTSProvider
+from .providers import DialogueProvider, DialogueProviderError, Playback, TTSProvider
 from .speech import SpeechSegmenter
 from .state import AssistantState, ConversationState, TurnState
 
@@ -38,6 +40,7 @@ class TurnManager:
         self._interruption = interruption
         self._turn_number = 0
         self._response_task: asyncio.Task[None] | None = None
+        self._response_tasks: set[asyncio.Task[None]] = set()
 
     async def user_speech_started(self) -> str:
         if self.state.turn_state is TurnState.AWAITING_COMMIT:
@@ -71,7 +74,10 @@ class TurnManager:
             raise RuntimeError("cannot commit without a turn")
         self.state.commit_turn(transcript)
         await self.events.publish(ConversationTurnCommitted(turn_id, transcript))
-        self._response_task = asyncio.create_task(self._respond(turn_id, transcript))
+        task = asyncio.create_task(self._respond(turn_id, transcript))
+        self._response_task = task
+        self._response_tasks.add(task)
+        task.add_done_callback(self._response_tasks.discard)
 
     async def abort_user_turn(self, reason: str, connection_generation: int = 0) -> str:
         """Return safely to listening without committing or starting dialogue."""
@@ -85,6 +91,21 @@ class TurnManager:
         if self._response_task:
             await self._response_task
 
+    async def close(self) -> None:
+        """End every response task and provider cleanup owned by this manager."""
+        self._playback.stop_now()
+        await self._interruption.close()
+        await asyncio.gather(
+            self._dialogue.cancel(), self._tts.cancel(), return_exceptions=True
+        )
+        tasks = tuple(self._response_tasks)
+        self._response_task = None
+        for task in tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _respond(self, turn_id: str, transcript: str) -> None:
         await self.events.publish(GenerationStarted(turn_id))
         segmenter = SpeechSegmenter()
@@ -96,10 +117,20 @@ class TurnManager:
                     await self._speak(turn_id, segment)
             if (segment := segmenter.flush()) is not None:
                 await self._speak(turn_id, segment)
+        except DialogueProviderError as error:
+            await self.events.publish(ProviderFailed(self._dialogue_provider_name(), str(error)))
         finally:
             # A newer user turn owns the state after barge-in.
             if self.state.current_turn == turn_id and self.state.assistant_state is not AssistantState.INTERRUPTED:
                 self.state.finish_assistant_turn()
+
+    def _dialogue_provider_name(self) -> str:
+        diagnostics = getattr(self._dialogue, "diagnostics", None)
+        if callable(diagnostics):
+            provider = diagnostics().get("provider")
+            if isinstance(provider, str) and provider:
+                return provider
+        return type(self._dialogue).__name__
 
     async def _speak(self, turn_id: str, text: str) -> None:
         if self.state.current_turn != turn_id or self._dialogue_cancelled():

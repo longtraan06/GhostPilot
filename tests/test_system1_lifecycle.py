@@ -70,10 +70,11 @@ class System1LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await runtime.on_user_speech_started()
 
         self.assertTrue(playback.stopped)
-        self.assertTrue(tts.cancelled)
-        self.assertTrue(dialogue.cancelled)
         self.assertEqual(runtime.state.turn_state, TurnState.USER_SPEAKING)
         self.assertEqual(runtime.state.user_state, UserState.SPEAKING)
+        await runtime.interruption.wait_for_cancellations()
+        self.assertTrue(tts.cancelled)
+        self.assertTrue(dialogue.cancelled)
         seen = []
         while not events.empty():
             seen.append((await events.get()).name)

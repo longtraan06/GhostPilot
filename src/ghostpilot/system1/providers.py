@@ -36,6 +36,10 @@ class DialogueOutput:
     action: dict[str, Any] | None = None
 
 
+class DialogueProviderError(RuntimeError):
+    """A provider-neutral dialogue transport or model-stream failure."""
+
+
 @dataclass(frozen=True, slots=True)
 class AudioChunk:
     data: bytes

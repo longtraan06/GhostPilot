@@ -268,6 +268,7 @@ class AudioVADRuntimeTests(unittest.IsolatedAsyncioTestCase):
         audio.push(frame(1, 6_000))
         await wait_until(lambda: runtime.state.turn_state is TurnState.USER_SPEAKING)
         self.assertTrue(playback.stopped)
+        await runtime.interruption.wait_for_cancellations()
         self.assertTrue(tts.cancelled)
         self.assertTrue(dialogue.cancelled)
         await runtime.close()
