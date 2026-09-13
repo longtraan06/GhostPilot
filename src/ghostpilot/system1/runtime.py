@@ -501,6 +501,12 @@ class System1Runtime:
         """Small state only: debug tooling never receives raw microphone PCM."""
         transcript = self.transcripts.snapshot()
         provider = self.stt.diagnostics()
+        dialogue_diagnostics_method = getattr(self.dialogue, "diagnostics", None)
+        dialogue_diagnostics = (
+            dialogue_diagnostics_method()
+            if callable(dialogue_diagnostics_method)
+            else {"provider": type(self.dialogue).__name__, "last_error": ""}
+        )
         now = asyncio.get_running_loop().time()
         endpoint_remaining_ms = (
             max(0.0, round((self._endpoint_deadline - now) * 1_000, 1))
@@ -545,6 +551,7 @@ class System1Runtime:
             "stt_turn_invalidated": self._stt_turn_invalidated,
             "stt_invalidation_detail": self._stt_invalidation_detail,
             "stt": provider,
+            "dialogue": dialogue_diagnostics,
             "latency": {
                 "speech_start_to_first_partial_ms": self._first_partial_latency_ms,
                 "speech_stop_to_segment_final_ms": self._segment_final_latency_ms,
@@ -558,6 +565,7 @@ class System1Runtime:
 def default_provider_registry(config: System1Config | None = None) -> ProviderRegistry:
     """Development-only composition; production registers adapter factories here."""
     from .adapters.nemotron_stt import NemotronSTTProvider
+    from .adapters.openai_compatible_dialogue import OpenAICompatibleDialogueProvider
 
     config = config or System1Config()
     registry = ProviderRegistry()
@@ -565,5 +573,9 @@ def default_provider_registry(config: System1Config | None = None) -> ProviderRe
     registry.register("mock", MockSTTProvider)
     registry.register("nemotron", lambda: NemotronSTTProvider(config.nemotron_stt))
     registry.register("mock.dialogue", MockDialogueProvider)
+    registry.register(
+        "openai-compatible",
+        lambda: OpenAICompatibleDialogueProvider(config.dialogue),
+    )
     registry.register("mock.tts", MockTTSProvider)
     return registry

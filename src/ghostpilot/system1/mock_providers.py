@@ -103,6 +103,27 @@ class MockDialogueProvider:
     async def cancel(self) -> None:
         self.cancelled = True
 
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "provider": "mock.dialogue",
+            "base_url": "local",
+            "model": "deterministic mock",
+            "request_active": False,
+            "request_generation": self.stream_calls,
+            "requests_started": self.stream_calls,
+            "requests_completed": 0,
+            "requests_cancelled": int(self.cancelled),
+            "requests_failed": 0,
+            "chunks_received": 0,
+            "characters_received": 0,
+            "last_error": "",
+            "last_finish_reason": "",
+            "last_ttft_ms": None,
+            "last_total_duration_ms": None,
+            "last_cancellation_latency_ms": None,
+            "live_text": "",
+        }
+
 
 class MockTTSProvider:
     def __init__(self, *, delay: float = 0) -> None:

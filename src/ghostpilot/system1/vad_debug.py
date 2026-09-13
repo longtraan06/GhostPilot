@@ -71,6 +71,8 @@ PAGE = """<!doctype html>
 <section class="card span12"><div class="label">Current Partial</div><div id="partial" class="live-text">Waiting for speech…</div></section>
 <section class="card span6"><div class="label">Current Final</div><div id="final" class="live-text final-text">—</div></section>
 <section class="card span6"><div class="label">Best Transcript</div><div id="best" class="live-text final-text">—</div></section>
+<section class="card span6"><div class="label">Dialogue Provider</div><dl><dt>Provider</dt><dd id="dialogueProvider">—</dd><dt>Model</dt><dd id="dialogueModel">—</dd><dt>Base URL</dt><dd id="dialogueBaseUrl">—</dd><dt>Active request</dt><dd id="dialogueActive">false</dd><dt>Generation</dt><dd id="dialogueGeneration">0</dd><dt>TTFT</dt><dd id="dialogueTtft">—</dd><dt>Chunks / characters</dt><dd id="dialogueChunks">0 / 0</dd><dt>Requests</dt><dd id="dialogueRequests">0 started · 0 done · 0 cancelled · 0 failed</dd><dt>Last finish</dt><dd id="dialogueFinish">—</dd><dt>Last error</dt><dd id="dialogueError">—</dd></dl></section>
+<section class="card span6"><div class="label">Live Dialogue Text</div><div id="dialogueText" class="live-text final-text">Waiting for a committed turn…</div></section>
 <section class="card span5"><div class="label">Turn + Segment</div><dl><dt>Turn ID</dt><dd id="turnId">—</dd><dt>Segment</dt><dd id="segment">—</dd><dt>Latest final</dt><dd id="latestFinal">false</dd><dt>Turn state</dt><dd id="turnState">LISTENING</dd><dt>Endpoint</dt><dd id="endpoint">IDLE</dd><dt>Deadline</dt><dd id="endpointDeadline">—</dd><dt>Remaining</dt><dd id="endpointTimer">—</dd></dl></section>
 <section class="card span7"><div class="label">Latency</div><div class="grid"><div class="span3"><div class="muted">Start → partial</div><div id="latPartial" class="metric">—</div></div><div class="span3"><div class="muted">Stop → final</div><div id="latFinal" class="metric">—</div></div><div class="span3"><div class="muted">Stop → commit</div><div id="latCommit" class="metric">—</div></div><div class="span3"><div class="muted">Response age</div><div id="responseAge" class="metric">—</div></div></div></section>
 <section class="card span4"><div class="label">Microphone + Listen Back</div><select id="device" aria-label="Microphone input device"><option>Loading devices…</option></select><button id="useDevice" style="margin-top:.5rem">Use selected input</button><button id="recordMic" style="margin-top:.5rem" disabled>Record 4 seconds</button><div id="micTestStatus" class="muted" style="margin-top:.5rem">Select an input first</div><audio id="micPlayback" controls hidden preload="metadata"></audio><div id="inputStatus" class="muted" style="margin-top:.5rem">No input connected</div></section>
@@ -91,6 +93,28 @@ const socket=new WebSocket(`ws://${location.host}/ws`);socket.onopen=()=>{setBad
 async function injectTranscript(isFinal){const text=$('mockTranscript').value.trim();if(!text)return;const response=await fetch('/api/mock-transcript',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,is_final:isFinal})}),data=await response.json();$('injectStatus').textContent=response.ok?`Sent ${isFinal?'final':'partial'} · ${data.turn_id}`:(data.detail||'Injection failed')}$('sendPartial').onclick=()=>injectTranscript(false);$('sendFinal').onclick=()=>injectTranscript(true);
 let microphoneRecordingUrl=null;async function recordMicrophone(){const button=$('recordMic'),status=$('micTestStatus'),audio=$('micPlayback');button.disabled=true;status.textContent='Recording… speak normally for 4 seconds';audio.hidden=true;try{const response=await fetch('/api/microphone-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration_seconds:4})});if(!response.ok){const data=await response.json();throw new Error(data.detail||'Microphone test failed')}const blob=await response.blob();if(microphoneRecordingUrl)URL.revokeObjectURL(microphoneRecordingUrl);microphoneRecordingUrl=URL.createObjectURL(blob);audio.src=microphoneRecordingUrl;audio.hidden=false;const seconds=Number(response.headers.get('X-Recorded-Duration')||0);status.textContent=seconds>0?`Captured ${seconds.toFixed(2)} seconds · press play to listen`:'No audio frames were captured'}catch(error){status.textContent=error.message}finally{button.disabled=false}}$('recordMic').onclick=recordMicrophone;
 </script></body></html>"""
+
+# Keep the established M3B dashboard markup intact and extend its live snapshot
+# renderer with provider-neutral dialogue diagnostics.
+PAGE = PAGE.replace("</script></body></html>", """</script><script>
+const ghostpilotSnapshot = snapshot;
+snapshot = function(s) {
+  ghostpilotSnapshot(s);
+  const dialogue = s.dialogue || {};
+  $('dialogueProvider').textContent = value(dialogue.provider);
+  $('dialogueModel').textContent = value(dialogue.model);
+  $('dialogueBaseUrl').textContent = value(dialogue.base_url);
+  $('dialogueActive').textContent = String(Boolean(dialogue.request_active));
+  $('dialogueGeneration').textContent = value(dialogue.request_generation);
+  $('dialogueTtft').textContent = ms(dialogue.last_ttft_ms);
+  $('dialogueChunks').textContent = `${value(dialogue.chunks_received)} / ${value(dialogue.characters_received)}`;
+  $('dialogueRequests').textContent = `${value(dialogue.requests_started)} started · ${value(dialogue.requests_completed)} done · ${value(dialogue.requests_cancelled)} cancelled · ${value(dialogue.requests_failed)} failed`;
+  $('dialogueFinish').textContent = value(dialogue.last_finish_reason);
+  $('dialogueError').textContent = value(dialogue.last_error);
+  $('dialogueError').className = dialogue.last_error ? 'error-text' : '';
+  $('dialogueText').textContent = dialogue.live_text || 'Waiting for a committed turn…';
+};
+</script></body></html>""")
 
 
 def create_app(runtime: System1Runtime) -> "FastAPI":

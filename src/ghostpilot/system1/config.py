@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import json
 import os
-from typing import TypeVar
+from typing import Any, TypeVar
+
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,35 @@ class NemotronSTTConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenAICompatibleDialogueConfig:
+    """Configuration for any OpenAI-compatible Chat Completions server."""
+
+    base_url: str = "http://localhost:3308/v1"
+    api_key: str = "anything"
+    # Leave this explicit: vLLM deployment model IDs are deployment-specific.
+    model: str = ""
+    temperature: float = 0.3
+    max_tokens: int = 256
+    timeout_seconds: float = 30.0
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    system_prompt: str = (
+        "You are GhostPilot, a low-latency conversational voice assistant. "
+        "Respond naturally and concisely. Prefer short, complete spoken sentences. "
+        "Avoid unnecessary markdown, long lists, and long preambles. Start answering directly."
+    )
+
+    def __post_init__(self) -> None:
+        if not self.base_url.strip():
+            raise ValueError("dialogue base_url must not be empty")
+        if self.max_tokens < 1:
+            raise ValueError("dialogue max_tokens must be positive")
+        if self.timeout_seconds <= 0:
+            raise ValueError("dialogue timeout_seconds must be positive")
+        if not isinstance(self.extra_body, dict):
+            raise ValueError("dialogue extra_body must be a JSON object")
+
+
+@dataclass(frozen=True, slots=True)
 class System1Config:
     stt_provider: str = "mock.stt"
     dialogue_provider: str = "mock.dialogue"
@@ -80,22 +112,61 @@ class System1Config:
     vad: VADConfig = field(default_factory=VADConfig)
     endpoint: EndpointConfig = field(default_factory=EndpointConfig)
     nemotron_stt: NemotronSTTConfig = field(default_factory=NemotronSTTConfig)
+    dialogue: OpenAICompatibleDialogueConfig = field(
+        default_factory=OpenAICompatibleDialogueConfig
+    )
 
     @classmethod
     def from_env(cls, **overrides: object) -> "System1Config":
-        """Load only deployment-facing provider settings from the environment."""
+        """Load local ``.env`` settings without overriding explicit shell variables."""
+        load_dotenv(override=False)
         provider = os.getenv("GHOSTPILOT_STT_PROVIDER", "mock")
         defaults = NemotronSTTConfig()
+        dialogue_defaults = OpenAICompatibleDialogueConfig()
         nemotron = NemotronSTTConfig(
             ws_url=os.getenv("GHOSTPILOT_STT_WS_URL", defaults.ws_url),
             health_url=os.getenv("GHOSTPILOT_STT_HEALTH_URL", defaults.health_url),
         )
+        dialogue = OpenAICompatibleDialogueConfig(
+            base_url=os.getenv("GHOSTPILOT_DIALOGUE_BASE_URL", dialogue_defaults.base_url),
+            api_key=os.getenv("GHOSTPILOT_DIALOGUE_API_KEY", dialogue_defaults.api_key),
+            model=os.getenv("GHOSTPILOT_DIALOGUE_MODEL", dialogue_defaults.model),
+            temperature=float(
+                os.getenv("GHOSTPILOT_DIALOGUE_TEMPERATURE", str(dialogue_defaults.temperature))
+            ),
+            max_tokens=int(
+                os.getenv("GHOSTPILOT_DIALOGUE_MAX_TOKENS", str(dialogue_defaults.max_tokens))
+            ),
+            timeout_seconds=float(
+                os.getenv(
+                    "GHOSTPILOT_DIALOGUE_TIMEOUT_SECONDS",
+                    str(dialogue_defaults.timeout_seconds),
+                )
+            ),
+            extra_body=_json_object_from_env("GHOSTPILOT_DIALOGUE_EXTRA_BODY_JSON"),
+            system_prompt=dialogue_defaults.system_prompt,
+        )
         values: dict[str, object] = {
             "stt_provider": provider,
             "nemotron_stt": nemotron,
+            "dialogue_provider": os.getenv("GHOSTPILOT_DIALOGUE_PROVIDER", "mock.dialogue"),
+            "dialogue": dialogue,
         }
         values.update(overrides)
         return cls(**values)  # type: ignore[arg-type]
+
+
+def _json_object_from_env(name: str) -> dict[str, Any]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{name} must contain a JSON object") from error
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must contain a JSON object")
+    return parsed
 
 
 T = TypeVar("T")
