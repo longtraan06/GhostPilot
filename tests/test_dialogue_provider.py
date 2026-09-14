@@ -63,6 +63,20 @@ class LateStream:
         self.closed += 1
 
 
+class CloseGateStream(LateStream):
+    """A stream whose transport close is deliberately delayed for race testing."""
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.close_started = asyncio.Event()
+        self.allow_close = asyncio.Event()
+
+    async def close(self):
+        self.closed += 1
+        self.close_started.set()
+        await self.allow_close.wait()
+
+
 class FakeCompletions:
     def __init__(self, results):
         self.results = list(results)
@@ -185,6 +199,32 @@ class OpenAICompatibleDialogueProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await new_task, ["new response"])
         self.assertFalse(provider.diagnostics()["request_active"])
         self.assertEqual(provider.diagnostics()["live_text"], "new response")
+
+    async def test_captured_old_cancellation_cannot_cancel_new_active_request(self):
+        old_stream = CloseGateStream("old response")
+        new_stream = LateStream("new response")
+        provider, _ = provider_for(old_stream, new_stream)
+        old_task = asyncio.create_task(collect(provider, "old"))
+        await old_stream.entered.wait()
+
+        cleanup = provider.invalidate_active()
+        self.assertIsNotNone(cleanup)
+        close_task = asyncio.create_task(cleanup.close())
+        await old_stream.close_started.wait()
+
+        new_task = asyncio.create_task(collect(provider, "new"))
+        await new_stream.entered.wait()
+        self.assertTrue(provider.diagnostics()["request_active"])
+
+        old_stream.allow_close.set()
+        await close_task
+        self.assertTrue(provider.diagnostics()["request_active"])
+        self.assertGreaterEqual(old_stream.closed, 1)
+
+        old_stream.release.set()
+        self.assertEqual(await old_task, [])
+        new_stream.release.set()
+        self.assertEqual(await new_task, ["new response"])
 
     async def test_recovers_after_connection_or_stream_error(self):
         good_stream = FakeStream([chunk("Recovered.")])

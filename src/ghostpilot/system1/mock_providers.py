@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 
-from .providers import AudioChunk, DialogueOutput, STTEvent, STTProviderEvent
+from .providers import (
+    AudioChunk,
+    DialogueCancellationHandle,
+    DialogueOutput,
+    STTEvent,
+    STTProviderEvent,
+)
+
+
+@dataclass(slots=True)
+class _MockDialogueCancellation:
+    provider: "MockDialogueProvider"
+
+    async def close(self) -> None:
+        # Logical invalidation already happened; mock transport has no I/O to close.
+        return None
 
 
 class MockSTTProvider:
@@ -89,19 +105,35 @@ class MockDialogueProvider:
         self.delay = delay
         self.cancelled = False
         self.stream_calls = 0
+        self._generation = 0
+        self._active_generation: int | None = None
 
     async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
         self.stream_calls += 1
+        self._generation += 1
+        generation = self._generation
         self.cancelled = False
-        for response in self.responses:
-            if self.delay:
-                await asyncio.sleep(self.delay)
-            if self.cancelled:
-                return
-            yield response
+        self._active_generation = generation
+        try:
+            for response in self.responses:
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if generation != self._active_generation:
+                    return
+                yield response
+        finally:
+            if generation == self._active_generation:
+                self._active_generation = None
+
+    def invalidate_active(self) -> DialogueCancellationHandle | None:
+        if self._active_generation is None:
+            return None
+        self._active_generation = None
+        self.cancelled = True
+        return _MockDialogueCancellation(self)
 
     async def cancel(self) -> None:
-        self.cancelled = True
+        self.invalidate_active()
 
     def diagnostics(self) -> dict[str, object]:
         return {

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 import inspect
 import logging
 from typing import Any
@@ -18,10 +19,30 @@ except ImportError:  # pragma: no cover - exercised by composition, not the fake
     AsyncOpenAI = None  # type: ignore[assignment,misc]
 
 from ..config import OpenAICompatibleDialogueConfig
-from ..providers import DialogueOutput, DialogueProviderError
+from ..providers import DialogueCancellationHandle, DialogueOutput, DialogueProviderError
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _OpenAIDialogueCancellation:
+    """Captured cleanup for one invalidated request, never a future request."""
+
+    provider: "OpenAICompatibleDialogueProvider"
+    generation: int
+    stream: Any | None
+    closed: bool = False
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        started_at = asyncio.get_running_loop().time()
+        await _close_stream(self.stream)
+        self.provider._last_cancellation_latency_ms = round(
+            (asyncio.get_running_loop().time() - started_at) * 1_000, 1
+        )
 
 
 def _normalise_base_url(base_url: str) -> str:
@@ -155,21 +176,24 @@ class OpenAICompatibleDialogueProvider:
                 if completed:
                     self._requests_completed += 1
 
-    async def cancel(self) -> None:
-        """Invalidate first, then close the current HTTP stream if one exists."""
+    def invalidate_active(self) -> DialogueCancellationHandle | None:
+        """Detach the current request synchronously and return its cleanup handle."""
         generation = self._active_generation
         if generation is None:
-            return
-        loop = asyncio.get_running_loop()
-        cancel_started_at = loop.time()
+            return None
         request_stream = self._active_stream
         # This synchronous invalidation blocks late chunks even while close awaits I/O.
         self._active_generation = None
         self._active_stream = None
         self._active_started_at = None
         self._requests_cancelled += 1
-        await _close_stream(request_stream)
-        self._last_cancellation_latency_ms = round((loop.time() - cancel_started_at) * 1_000, 1)
+        return _OpenAIDialogueCancellation(self, generation, request_stream)
+
+    async def cancel(self) -> None:
+        """Explicit cancellation intentionally targets whichever request is active now."""
+        cleanup = self.invalidate_active()
+        if cleanup is not None:
+            await cleanup.close()
 
     def diagnostics(self) -> dict[str, object]:
         return {

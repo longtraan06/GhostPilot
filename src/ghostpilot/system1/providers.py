@@ -40,6 +40,12 @@ class DialogueProviderError(RuntimeError):
     """A provider-neutral dialogue transport or model-stream failure."""
 
 
+class DialogueCancellationHandle(Protocol):
+    """A request-specific, asynchronously closable dialogue transport cleanup."""
+
+    async def close(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class AudioChunk:
     data: bytes
@@ -61,6 +67,7 @@ class STTProvider(Protocol):
 
 class DialogueProvider(Protocol):
     def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]: ...
+    def invalidate_active(self) -> DialogueCancellationHandle | None: ...
     async def cancel(self) -> None: ...
 
 
