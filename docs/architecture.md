@@ -68,3 +68,13 @@ DialogueProvider
 TTSProvider
 
 Providers must be replaceable through configuration.
+
+## Short-term dialogue context
+
+System 1 owns a bounded, in-memory sequence of completed user/assistant
+exchanges. Before each generation it builds a provider-neutral message sequence
+containing the system prompt, selected complete exchanges, and the current user
+turn. Dialogue providers remain stateless transports: they neither retain nor
+invent history. This context is local to a runtime, excluded from events and
+debug transcript payloads, and will not be moved to the Orchestrator until that
+component owns durable session state.

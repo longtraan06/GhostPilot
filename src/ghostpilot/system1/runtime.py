@@ -11,6 +11,7 @@ from typing import cast
 
 from .audio import AudioFrame, AudioInput, AudioPreRollBuffer, TurnAudioBuffer
 from .config import ProviderRegistry, System1Config
+from .dialogue_context import ConversationHistory, DialogueContextBuilder
 from .endpoint import EndpointDetector, EndpointState, FinalTranscriptEndpointDetector
 from .event_bus import EventBus
 from .events import (
@@ -102,7 +103,14 @@ class System1Runtime:
             self.state, self.events, self.dialogue, self.tts, self.playback
         )
         self.turns = TurnManager(
-            self.state, self.events, self.dialogue, self.tts, self.playback, self.interruption
+            self.state,
+            self.events,
+            self.dialogue,
+            self.tts,
+            self.playback,
+            self.interruption,
+            ConversationHistory(self.config.dialogue_context),
+            DialogueContextBuilder(self.config.dialogue_context),
         )
 
     @classmethod
@@ -233,6 +241,10 @@ class System1Runtime:
 
     async def wait_for_response(self) -> None:
         await self.turns.wait_for_response()
+
+    def clear_dialogue_history(self) -> None:
+        """Explicitly reset only in-memory short-term dialogue context."""
+        self.turns.clear_dialogue_history()
 
     def set_audio_frame_observer(
         self, observer: Callable[[AudioFrame], None] | None
@@ -553,6 +565,7 @@ class System1Runtime:
             "stt_invalidation_detail": self._stt_invalidation_detail,
             "stt": provider,
             "dialogue": dialogue_diagnostics,
+            "dialogue_context": self.turns.context_diagnostics(),
             "latency": {
                 "speech_start_to_first_partial_ms": self._first_partial_latency_ms,
                 "speech_stop_to_segment_final_ms": self._segment_final_latency_ms,

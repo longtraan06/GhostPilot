@@ -6,7 +6,7 @@ from ghostpilot.system1.adapters.openai_compatible_dialogue import (
     OpenAICompatibleDialogueProvider,
 )
 from ghostpilot.system1.config import OpenAICompatibleDialogueConfig
-from ghostpilot.system1.providers import DialogueProviderError
+from ghostpilot.system1.providers import DialogueMessage, DialogueProviderError
 
 
 def chunk(content=None, *, finish_reason=None):
@@ -118,7 +118,8 @@ def provider_for(*results):
 
 
 async def collect(provider, transcript="hello"):
-    return [output.text async for output in provider.stream(transcript)]
+    messages = (DialogueMessage("user", transcript),)
+    return [output.text async for output in provider.stream(messages)]
 
 
 class OpenAICompatibleDialogueProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -268,4 +269,22 @@ class OpenAICompatibleDialogueProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             client.completions.calls[0]["extra_body"],
             {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+    async def test_provider_is_stateless_and_sends_only_each_prepared_message_sequence(self):
+        client = FakeClient([FakeStream([chunk("one")]), FakeStream([chunk("two")])])
+        provider = OpenAICompatibleDialogueProvider(
+            OpenAICompatibleDialogueConfig(model="served-model"), client=client
+        )
+        first = (DialogueMessage("system", "brief"), DialogueMessage("user", "first"))
+        second = (DialogueMessage("user", "second"),)
+
+        self.assertEqual([output.text async for output in provider.stream(first)], ["one"])
+        self.assertEqual([output.text async for output in provider.stream(second)], ["two"])
+        self.assertEqual(
+            client.completions.calls[0]["messages"],
+            [{"role": "system", "content": "brief"}, {"role": "user", "content": "first"}],
+        )
+        self.assertEqual(
+            client.completions.calls[1]["messages"], [{"role": "user", "content": "second"}]
         )

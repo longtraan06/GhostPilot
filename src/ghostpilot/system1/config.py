@@ -86,11 +86,6 @@ class OpenAICompatibleDialogueConfig:
     max_tokens: int = 256
     timeout_seconds: float = 30.0
     extra_body: dict[str, Any] = field(default_factory=dict)
-    system_prompt: str = (
-        "You are GhostPilot, a low-latency conversational voice assistant. "
-        "Respond naturally and concisely. Prefer short, complete spoken sentences. "
-        "Avoid unnecessary markdown, long lists, and long preambles. Start answering directly."
-    )
 
     def __post_init__(self) -> None:
         if not self.base_url.strip():
@@ -101,6 +96,25 @@ class OpenAICompatibleDialogueConfig:
             raise ValueError("dialogue timeout_seconds must be positive")
         if not isinstance(self.extra_body, dict):
             raise ValueError("dialogue extra_body must be a JSON object")
+
+
+@dataclass(frozen=True, slots=True)
+class DialogueContextConfig:
+    """Bounded, in-memory short-term context policy owned by System 1."""
+
+    system_prompt: str = (
+        "You are GhostPilot, a low-latency conversational voice assistant. "
+        "Respond naturally and concisely. Prefer short, complete spoken sentences. "
+        "Avoid unnecessary markdown, long lists, and long preambles. Start answering directly."
+    )
+    max_history_exchanges: int = 4
+    max_history_chars: int = 6_000
+
+    def __post_init__(self) -> None:
+        if self.max_history_exchanges < 0:
+            raise ValueError("dialogue max_history_exchanges must not be negative")
+        if self.max_history_chars < 0:
+            raise ValueError("dialogue max_history_chars must not be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +129,7 @@ class System1Config:
     dialogue: OpenAICompatibleDialogueConfig = field(
         default_factory=OpenAICompatibleDialogueConfig
     )
+    dialogue_context: DialogueContextConfig = field(default_factory=DialogueContextConfig)
 
     @classmethod
     def from_env(cls, **overrides: object) -> "System1Config":
@@ -123,6 +138,7 @@ class System1Config:
         provider = os.getenv("GHOSTPILOT_STT_PROVIDER", "mock")
         defaults = NemotronSTTConfig()
         dialogue_defaults = OpenAICompatibleDialogueConfig()
+        context_defaults = DialogueContextConfig()
         nemotron = NemotronSTTConfig(
             ws_url=os.getenv("GHOSTPILOT_STT_WS_URL", defaults.ws_url),
             health_url=os.getenv("GHOSTPILOT_STT_HEALTH_URL", defaults.health_url),
@@ -144,13 +160,30 @@ class System1Config:
                 )
             ),
             extra_body=_json_object_from_env("GHOSTPILOT_DIALOGUE_EXTRA_BODY_JSON"),
-            system_prompt=dialogue_defaults.system_prompt,
+        )
+        dialogue_context = DialogueContextConfig(
+            system_prompt=os.getenv(
+                "GHOSTPILOT_DIALOGUE_SYSTEM_PROMPT", context_defaults.system_prompt
+            ),
+            max_history_exchanges=int(
+                os.getenv(
+                    "GHOSTPILOT_DIALOGUE_HISTORY_MAX_EXCHANGES",
+                    str(context_defaults.max_history_exchanges),
+                )
+            ),
+            max_history_chars=int(
+                os.getenv(
+                    "GHOSTPILOT_DIALOGUE_HISTORY_MAX_CHARS",
+                    str(context_defaults.max_history_chars),
+                )
+            ),
         )
         values: dict[str, object] = {
             "stt_provider": provider,
             "nemotron_stt": nemotron,
             "dialogue_provider": os.getenv("GHOSTPILOT_DIALOGUE_PROVIDER", "mock.dialogue"),
             "dialogue": dialogue,
+            "dialogue_context": dialogue_context,
         }
         values.update(overrides)
         return cls(**values)  # type: ignore[arg-type]

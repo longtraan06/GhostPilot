@@ -7,7 +7,7 @@ provider-neutral ``DialogueOutput`` stream.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 import inspect
 import logging
@@ -19,7 +19,12 @@ except ImportError:  # pragma: no cover - exercised by composition, not the fake
     AsyncOpenAI = None  # type: ignore[assignment,misc]
 
 from ..config import OpenAICompatibleDialogueConfig
-from ..providers import DialogueCancellationHandle, DialogueOutput, DialogueProviderError
+from ..providers import (
+    DialogueCancellationHandle,
+    DialogueMessage,
+    DialogueOutput,
+    DialogueProviderError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -88,8 +93,10 @@ class OpenAICompatibleDialogueProvider:
         self._last_cancellation_latency_ms: float | None = None
         self._live_text = ""
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
-        """Yield content deltas immediately while this request owns the generation."""
+    async def stream(
+        self, messages: Sequence[DialogueMessage]
+    ) -> AsyncIterator[DialogueOutput]:
+        """Stream exactly the prepared vendor-neutral messages supplied by System 1."""
         loop = asyncio.get_running_loop()
         self._generation += 1
         generation = self._generation
@@ -115,8 +122,7 @@ class OpenAICompatibleDialogueProvider:
             request_options: dict[str, Any] = {
                 "model": self._config.model,
                 "messages": [
-                    {"role": "system", "content": self._config.system_prompt},
-                    {"role": "user", "content": transcript},
+                    {"role": message.role, "content": message.content} for message in messages
                 ],
                 "stream": True,
                 "temperature": self._config.temperature,

@@ -353,6 +353,39 @@ existing full-turn snapshot contract. A service that returns segment-local text
 must normalize/merge it in its adapter rather than adding provider-specific
 merging to `TranscriptManager`.
 
+## Milestone 4B: bounded short-term dialogue context
+
+`TurnManager` owns an in-memory `ConversationHistory` of complete exchanges.
+It builds every request as a provider-neutral ordered sequence:
+
+```text
+system prompt
+→ selected complete user / assistant exchanges, oldest first
+→ current user turn
+```
+
+The builder selects newest exchanges first under both configurable limits,
+then restores chronological order. It never emits an orphan user or assistant
+message; an oversized exchange is skipped and the scan continues to older
+eligible exchanges. The system prompt and current turn are always present.
+The defaults are four exchanges and 6,000 historical characters, configurable
+through `GHOSTPILOT_DIALOGUE_HISTORY_MAX_EXCHANGES` and
+`GHOSTPILOT_DIALOGUE_HISTORY_MAX_CHARS` (and an optional
+`GHOSTPILOT_DIALOGUE_SYSTEM_PROMPT`).
+
+An exchange is appended only after a dialogue stream completes normally,
+produces non-empty assistant text, and still owns the active turn. Partial,
+failed, cancelled, interrupted, and stale responses therefore never affect the
+next request. `System1Runtime.clear_dialogue_history()` is the explicit reset;
+STT reset or reconnect does not clear it. The debug snapshot reports context
+counts, character totals, limits, and an estimated token count only—never the
+history text.
+
+`DialogueProvider.stream(messages)` receives this already-prepared sequence
+and remains stateless. OpenAI-compatible adapters map it directly to Chat
+Completions messages; their configuration contains transport/model options,
+not session history.
+
 ## Required Tests
 
 Normal flow:

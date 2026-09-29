@@ -1,11 +1,16 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 import time
 import unittest
 
-from ghostpilot.system1.mock_providers import MockPlayback, MockSTTProvider, MockTTSProvider
-from ghostpilot.system1.providers import DialogueOutput, DialogueProviderError
+from ghostpilot.system1.mock_providers import (
+    MockDialogueProvider,
+    MockPlayback,
+    MockSTTProvider,
+    MockTTSProvider,
+)
+from ghostpilot.system1.providers import DialogueMessage, DialogueOutput, DialogueProviderError
 from ghostpilot.system1.runtime import System1Runtime
 from ghostpilot.system1.state import TurnState
 
@@ -25,7 +30,7 @@ class ControlledDialogue:
         self.allow_old = asyncio.Event()
         self._active = False
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
         call_index = self.stream_calls
         self.stream_calls += 1
         self._active = True
@@ -57,7 +62,7 @@ class SlowCancelDialogue:
         self.cancel_calls = 0
         self._active = False
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
         self.started.set()
         self._active = True
         yield DialogueOutput("Still speaking.")
@@ -96,7 +101,7 @@ class BlockingDialogue:
         self.started = asyncio.Event()
         self.cancel_calls = 0
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
         self.started.set()
         await asyncio.Event().wait()
         yield DialogueOutput("unreachable")
@@ -117,7 +122,7 @@ class ScriptedDialogue:
         self.stream_calls = 0
         self.cancel_calls = 0
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
         script = self.scripts[self.stream_calls]
         self.stream_calls += 1
         for item in script:
@@ -148,8 +153,10 @@ class PausedCleanupDialogue:
         self.cleanup_started = asyncio.Event()
         self.release_cleanup = asyncio.Event()
         self.closed_generations: list[int] = []
+        self.requests: list[tuple[DialogueMessage, ...]] = []
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
+        self.requests.append(tuple(messages))
         self.generation += 1
         generation = self.generation
         self.active_generation = generation
@@ -193,6 +200,69 @@ class PausedDialogueCleanup:
 
 
 class DialogueRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_exchanges_build_short_term_context_and_join_raw_chunks(self) -> None:
+        dialogue = MockDialogueProvider([DialogueOutput("Python"), DialogueOutput(" is useful.")])
+        runtime = System1Runtime(dialogue=dialogue)
+        await runtime.start()
+
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("My favourite language is Python.")
+        await runtime.wait_for_response()
+        self.assertEqual(runtime.turns.history.exchange_count, 1)
+        self.assertEqual(
+            runtime.turns.history.exchanges()[0].assistant, "Python is useful."
+        )
+        self.assertEqual(
+            [(message.role, message.content) for message in dialogue.requests[0]],
+            [
+                ("system", runtime.config.dialogue_context.system_prompt),
+                ("user", "My favourite language is Python."),
+            ],
+        )
+
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("What language did I mention?")
+        await runtime.wait_for_response()
+        self.assertEqual(
+            [(message.role, message.content) for message in dialogue.requests[1]],
+            [
+                ("system", runtime.config.dialogue_context.system_prompt),
+                ("user", "My favourite language is Python."),
+                ("assistant", "Python is useful."),
+                ("user", "What language did I mention?"),
+            ],
+        )
+        self.assertEqual(runtime.turns.history.exchange_count, 2)
+        await runtime.close()
+
+    async def test_explicit_history_clear_and_stt_reset_do_not_share_lifecycle(self) -> None:
+        dialogue = MockDialogueProvider([DialogueOutput("Done.")])
+        stt = MockSTTProvider()
+        runtime = System1Runtime(stt=stt, dialogue=dialogue)
+        await runtime.start()
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("remember this")
+        await runtime.wait_for_response()
+        self.assertEqual(runtime.turns.history.exchange_count, 1)
+
+        await stt.reset()
+        self.assertEqual(runtime.turns.history.exchange_count, 1)
+        runtime.clear_dialogue_history()
+        self.assertEqual(runtime.turns.history.exchange_count, 0)
+
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("fresh turn")
+        await runtime.wait_for_response()
+        self.assertEqual(
+            [(message.role, message.content) for message in dialogue.requests[-1]],
+            [("system", runtime.config.dialogue_context.system_prompt), ("user", "fresh turn")],
+        )
+        await runtime.close()
+
     async def test_late_old_barge_in_cleanup_cannot_cancel_new_dialogue_request(self) -> None:
         dialogue = PausedCleanupDialogue()
         playback = MockPlayback()
@@ -206,10 +276,15 @@ class DialogueRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         await runtime.on_user_speech_started()
         await dialogue.cleanup_started.wait()
+        self.assertEqual(runtime.turns.history.exchange_count, 0)
         await runtime.on_user_speech_stopped()
         await runtime.commit_turn("second")
         await dialogue.second_started.wait()
         self.assertEqual(dialogue.active_generation, 2)
+        self.assertEqual(
+            [(message.role, message.content) for message in dialogue.requests[1]],
+            [("system", runtime.config.dialogue_context.system_prompt), ("user", "second")],
+        )
 
         dialogue.release_cleanup.set()
         await runtime.interruption.wait_for_cancellations()
@@ -221,6 +296,10 @@ class DialogueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         dialogue.release_first.set()
         await asyncio.sleep(0)
         self.assertEqual([audio.data for audio in playback.played], [b"Old response.", b"New response."])
+        self.assertEqual(
+            [(exchange.user, exchange.assistant) for exchange in runtime.turns.history.exchanges()],
+            [("second", "New response.")],
+        )
         await runtime.close()
 
     async def test_barge_in_does_not_wait_for_slow_provider_cancellation(self) -> None:
@@ -360,6 +439,7 @@ class DialogueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure.provider, "scripted-dialogue")
         self.assertIn("connection refused", failure.detail)
         self.assertEqual(runtime.state.turn_state, TurnState.LISTENING)
+        self.assertEqual(runtime.turns.history.exchange_count, 0)
 
         await runtime.on_user_speech_started()
         await runtime.on_user_speech_stopped()
@@ -386,4 +466,16 @@ class DialogueRuntimeTests(unittest.IsolatedAsyncioTestCase):
             seen.append((await events.get()).name)
         self.assertIn("system.provider_failed", seen)
         self.assertEqual(runtime.state.turn_state, TurnState.LISTENING)
+        self.assertEqual(runtime.turns.history.exchange_count, 0)
+        await runtime.close()
+
+    async def test_empty_completed_response_is_not_added_to_history(self) -> None:
+        runtime = System1Runtime(dialogue=ScriptedDialogue([[]]))
+        await runtime.start()
+        await runtime.on_user_speech_started()
+        await runtime.on_user_speech_stopped()
+        await runtime.commit_turn("no text should be stored")
+        await runtime.wait_for_response()
+
+        self.assertEqual(runtime.turns.history.exchange_count, 0)
         await runtime.close()

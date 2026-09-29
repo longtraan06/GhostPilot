@@ -1,8 +1,9 @@
 # GhostPilot
 
 GhostPilot is a latency-first ambient personal agent. This repository contains
-the vendor-neutral, asyncio-based System 1 interaction runtime through M3B,
-including real microphone/VAD and self-hosted streaming STT support.
+the vendor-neutral, asyncio-based System 1 interaction runtime through M4B,
+including real microphone/VAD, self-hosted streaming STT, streaming dialogue,
+and bounded in-memory short-term conversation context.
 
 ## Quick start
 
@@ -50,3 +51,15 @@ Orchestrator may subscribe to those events and route them to System 2 or tools.
 VAD emits `audio.speech_stopped` without committing a turn. A future endpoint
 detector must explicitly call `System1Runtime.commit_turn(transcript)` before
 generation begins.
+
+Dialogue history is local to a `System1Runtime`. It includes only completed
+user/assistant exchanges and is prepared into provider-neutral messages before
+each dialogue request. Adjust its limits with
+`GHOSTPILOT_DIALOGUE_HISTORY_MAX_EXCHANGES` and
+`GHOSTPILOT_DIALOGUE_HISTORY_MAX_CHARS` in `.env`; use
+`System1Runtime.clear_dialogue_history()` to reset it deliberately. To compare
+real-server TTFT across context sizes, run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_dialogue_context.py
+```

@@ -23,6 +23,12 @@ class MicrophoneTestRecorderTests(unittest.TestCase):
         self.assertIn('id="endpointDeadline"', PAGE)
         self.assertIn("endpoint_deadline_monotonic", PAGE)
 
+    def test_dashboard_exposes_aggregate_dialogue_context_without_history_text(self) -> None:
+        self.assertIn('id="contextExchanges"', PAGE)
+        self.assertIn('id="contextHistory"', PAGE)
+        self.assertIn('id="contextTokens"', PAGE)
+        self.assertIn("const context = s.dialogue_context || {}", PAGE)
+
     def test_canonical_frames_are_returned_as_playable_wav(self) -> None:
         recorder = MicrophoneTestRecorder()
         recorder.start(1)

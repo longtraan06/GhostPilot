@@ -5,6 +5,7 @@
 - System 2 handles deep reasoning and long-running cognitive tasks.
 - STT, Dialogue, and TTS providers must be replaceable.
 - Vendor-specific SDK code must stay inside provider adapters.
+- System 1 owns bounded, in-memory dialogue context; dialogue adapters stay stateless and receive prepared messages.
 - Optimize for latency first.
 - Language is not a constraint; English-first is acceptable.
 - Barge-in must stop playback immediately before waiting for cloud cancellation.

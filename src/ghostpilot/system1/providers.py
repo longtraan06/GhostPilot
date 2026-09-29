@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -36,6 +36,14 @@ class DialogueOutput:
     action: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DialogueMessage:
+    """Vendor-neutral immutable input to a dialogue provider."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
 class DialogueProviderError(RuntimeError):
     """A provider-neutral dialogue transport or model-stream failure."""
 
@@ -66,7 +74,7 @@ class STTProvider(Protocol):
 
 
 class DialogueProvider(Protocol):
-    def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]: ...
+    def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]: ...
     def invalidate_active(self) -> DialogueCancellationHandle | None: ...
     async def cancel(self) -> None: ...
 

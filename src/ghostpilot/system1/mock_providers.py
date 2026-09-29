@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 
 from .providers import (
     AudioChunk,
     DialogueCancellationHandle,
+    DialogueMessage,
     DialogueOutput,
     STTEvent,
     STTProviderEvent,
@@ -107,9 +108,11 @@ class MockDialogueProvider:
         self.stream_calls = 0
         self._generation = 0
         self._active_generation: int | None = None
+        self.requests: list[tuple[DialogueMessage, ...]] = []
 
-    async def stream(self, transcript: str) -> AsyncIterator[DialogueOutput]:
+    async def stream(self, messages: Sequence[DialogueMessage]) -> AsyncIterator[DialogueOutput]:
         self.stream_calls += 1
+        self.requests.append(tuple(messages))
         self._generation += 1
         generation = self._generation
         self.cancelled = False

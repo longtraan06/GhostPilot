@@ -73,6 +73,7 @@ PAGE = """<!doctype html>
 <section class="card span6"><div class="label">Best Transcript</div><div id="best" class="live-text final-text">—</div></section>
 <section class="card span6"><div class="label">Dialogue Provider</div><dl><dt>Provider</dt><dd id="dialogueProvider">—</dd><dt>Model</dt><dd id="dialogueModel">—</dd><dt>Base URL</dt><dd id="dialogueBaseUrl">—</dd><dt>Active request</dt><dd id="dialogueActive">false</dd><dt>Generation</dt><dd id="dialogueGeneration">0</dd><dt>TTFT</dt><dd id="dialogueTtft">—</dd><dt>Chunks / characters</dt><dd id="dialogueChunks">0 / 0</dd><dt>Requests</dt><dd id="dialogueRequests">0 started · 0 done · 0 cancelled · 0 failed</dd><dt>Last finish</dt><dd id="dialogueFinish">—</dd><dt>Last error</dt><dd id="dialogueError">—</dd></dl></section>
 <section class="card span6"><div class="label">Live Dialogue Text</div><div id="dialogueText" class="live-text final-text">Waiting for a committed turn…</div></section>
+<section class="card span6"><div class="label">Dialogue Context</div><dl><dt>Completed exchanges</dt><dd id="contextExchanges">0</dd><dt>History messages / chars</dt><dd id="contextHistory">0 / 0</dd><dt>Configured budget</dt><dd id="contextBudget">0 exchanges · 0 chars</dd><dt>Last request messages / chars</dt><dd id="contextLast">0 / 0</dd><dt>Estimated tokens</dt><dd id="contextTokens">0</dd></dl></section>
 <section class="card span5"><div class="label">Turn + Segment</div><dl><dt>Turn ID</dt><dd id="turnId">—</dd><dt>Segment</dt><dd id="segment">—</dd><dt>Latest final</dt><dd id="latestFinal">false</dd><dt>Turn state</dt><dd id="turnState">LISTENING</dd><dt>Endpoint</dt><dd id="endpoint">IDLE</dd><dt>Deadline</dt><dd id="endpointDeadline">—</dd><dt>Remaining</dt><dd id="endpointTimer">—</dd></dl></section>
 <section class="card span7"><div class="label">Latency</div><div class="grid"><div class="span3"><div class="muted">Start → partial</div><div id="latPartial" class="metric">—</div></div><div class="span3"><div class="muted">Stop → final</div><div id="latFinal" class="metric">—</div></div><div class="span3"><div class="muted">Stop → commit</div><div id="latCommit" class="metric">—</div></div><div class="span3"><div class="muted">Response age</div><div id="responseAge" class="metric">—</div></div></div></section>
 <section class="card span4"><div class="label">Microphone + Listen Back</div><select id="device" aria-label="Microphone input device"><option>Loading devices…</option></select><button id="useDevice" style="margin-top:.5rem">Use selected input</button><button id="recordMic" style="margin-top:.5rem" disabled>Record 4 seconds</button><div id="micTestStatus" class="muted" style="margin-top:.5rem">Select an input first</div><audio id="micPlayback" controls hidden preload="metadata"></audio><div id="inputStatus" class="muted" style="margin-top:.5rem">No input connected</div></section>
@@ -117,6 +118,21 @@ snapshot = function(s) {
 </script></body></html>""")
 PAGE = PAGE.replace("GhostPilot System 1 · M3B", "GhostPilot System 1 · Realtime Debug")
 PAGE = PAGE.replace("GhostPilot System 1 — M3B Realtime Debug", "GhostPilot System 1 — Realtime Debug")
+
+# Context diagnostics deliberately expose aggregate values only, never the
+# conversation content used to prepare a provider request.
+PAGE = PAGE.replace("</script></body></html>", """</script><script>
+const ghostpilotContextSnapshot = snapshot;
+snapshot = function(s) {
+  ghostpilotContextSnapshot(s);
+  const context = s.dialogue_context || {};
+  $('contextExchanges').textContent = value(context.completed_exchanges);
+  $('contextHistory').textContent = `${value(context.history_messages)} / ${value(context.history_chars)}`;
+  $('contextBudget').textContent = `${value(context.max_history_exchanges)} exchanges · ${value(context.max_history_chars)} chars`;
+  $('contextLast').textContent = `${value(context.last_context_messages)} / ${value(context.last_context_chars)}`;
+  $('contextTokens').textContent = value(context.estimated_tokens);
+};
+</script></body></html>""")
 
 
 def create_app(runtime: System1Runtime) -> "FastAPI":
